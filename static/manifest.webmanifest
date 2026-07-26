@@ -1,0 +1,16 @@
+{
+  "name": "Cozy AI Girlfriend",
+  "short_name": "CozyGF",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1c1411",
+  "theme_color": "#2b1e1a",
+  "icons": [
+    {
+      "src": "/static/icons/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

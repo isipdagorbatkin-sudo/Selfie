@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#2b1e1a" />
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/static/icons/icon.svg" />
+    <title>Cozy AI Girlfriend</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Marck+Script&family=Nunito:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/css/style.css" />
+  </head>
+  <body>
+    <div class="bg-glow"></div>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="avatar-wrap">
+          <img
+            id="animeAvatar"
+            class="avatar"
+            src="https://placehold.co/320x320/png?text=Anime+Girl"
+            alt="Anime girl avatar"
+          />
+        </div>
+        <div class="title-wrap">
+          <h1>Твоя ламповая подруга</h1>
+          <p>online • всегда рядом 🤍</p>
+        </div>
+      </header>
+
+      <section id="chat" class="chat" aria-live="polite"></section>
+
+      <div id="typingIndicator" class="typing hidden" role="status" aria-live="polite">
+        <span>Подруга печатает</span>
+        <div class="dots">
+          <i></i><i></i><i></i>
+        </div>
+      </div>
+
+      <form id="chatForm" class="composer" autocomplete="off">
+        <input
+          id="messageInput"
+          type="text"
+          placeholder="Напиши что чувствуешь..."
+          maxlength="1000"
+          required
+        />
+        <button type="submit">Отправить</button>
+      </form>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>

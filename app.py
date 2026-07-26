@@ -16,6 +16,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 APP_TIMEZONE_OFFSET = int(os.environ.get("APP_TIMEZONE_OFFSET", "3"))
+ENABLE_LOCAL_FALLBACK = os.environ.get("ENABLE_LOCAL_FALLBACK", "1") == "1"
 
 
 def build_gemini_client() -> Optional[genai.Client]:
@@ -275,6 +276,32 @@ def build_history_context(history: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
+    pet_names = ["котик", "солнышко", "милый", "родной", "радость моя"]
+    smiles = ["(｡♥‿♥｡)", "(⁠*⁠^⁠_⁠^⁠*⁠)", "🤍", "✨"]
+    pet = random.choice(pet_names)
+    smile = random.choice(smiles)
+
+    lower = user_text.lower()
+    intro = f"Я тут, {pet} {smile}"
+
+    if period == "night":
+        care = "Уже поздно... почему не спишь? Давай чуть выдохнем и потом отдыхать, ладно?"
+    elif period == "morning":
+        care = "Доброе утро, солнышко! Как ты себя чувствуешь сегодня?"
+    elif period == "day":
+        care = "Если ты сейчас на учебе или работе, я рядом и тихо поддерживаю тебя 🤍"
+    else:
+        care = "Вечерний вайб такой уютный... расскажи, как твой день прошел?"
+
+    if any(word in lower for word in ["плохо", "груст", "устал", "трев", "депр"]):
+        support = "Обниму мысленно крепко. Давай по шагам: вода, пару глубоких вдохов и я слушаю тебя внимательно."
+    else:
+        support = "Расскажи еще чуть-чуть, мне правда важно, что у тебя на душе."
+
+    return [intro, care, support]
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -336,7 +363,7 @@ def api_chat() -> Any:
         facts=facts,
     )
 
-    history_context = build_history_context(history)
+    history_context = build_history_context(history[-12:])
 
     user_prompt = f"""
 История диалога:
@@ -358,7 +385,39 @@ def api_chat() -> Any:
         )
         ai_text = (model_response.text or "").strip()
     except Exception as ex:
-        return jsonify({"messages": [f"Ошибка Gemini API: {ex}"]}), 500
+        err_text = str(ex)
+        is_quota = "429" in err_text or "RESOURCE_EXHAUSTED" in err_text
+
+        if ENABLE_LOCAL_FALLBACK and is_quota:
+            fallback_messages = build_local_fallback_messages(user_text, period)
+
+            if db_conn is not None:
+                try:
+                    with db_conn:
+                        save_message(db_conn, user_id, "user", user_text)
+                        for msg in fallback_messages:
+                            save_message(db_conn, user_id, "assistant", msg)
+                        upsert_fact_if_detected(db_conn, user_id, user_text)
+                except Exception:
+                    pass
+                finally:
+                    db_conn.close()
+
+            return jsonify(
+                {
+                    "messages": fallback_messages,
+                    "meta": {
+                        "period": period,
+                        "playful_mode": False,
+                        "server_time": server_now.isoformat(),
+                        "fallback": "local_quota",
+                    },
+                }
+            )
+
+        if db_conn is not None:
+            db_conn.close()
+        return jsonify({"messages": ["Временный сбой ответа, попробуй через минутку 🤍"]}), 502
 
     if not ai_text:
         ai_text = "Я рядом, котик 🤍 Расскажи, что у тебя на душе?"

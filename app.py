@@ -115,6 +115,16 @@ def fetch_chat_history(conn, user_id: str, limit: int = 30) -> List[Dict[str, An
         return list(cur.fetchall() or [])
 
 
+def count_total_messages(conn, user_id: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM chat_messages WHERE user_id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
 def fetch_recent_assistant_messages(conn, user_id: str, limit: int = 8) -> List[str]:
     with conn.cursor() as cur:
         cur.execute(
@@ -149,11 +159,29 @@ def upsert_fact_if_detected(conn, user_id: str, text: str) -> None:
     if name_match:
         pairs.append(("name", name_match.group(1), 0.8))
 
+    age_match = re.search(r"(?:мне|мо(?:ё|ю)|возраст)\s*(?:сейчас\s*)?(\d{1,2})\s*(?:лет|год)", lowered)
+    if age_match:
+        pairs.append(("age", age_match.group(1), 0.7))
+
     if "работ" in lowered:
         pairs.append(("occupation_hint", "user mentions work", 0.6))
 
-    if "учеб" in lowered or "универ" in lowered:
+    if "учеб" in lowered or "универ" in lowered or "школ" in lowered or "университет" in lowered:
         pairs.append(("study_hint", "user mentions study", 0.6))
+
+    hobby_match = re.search(
+        r"(?:люблю|нравит(?:ся|ся)|увлекаюсь|смотрю|играю)\s+(.{3,60})",
+        lowered,
+    )
+    if hobby_match:
+        pairs.append(("hobby", hobby_match.group(1).strip()[:60], 0.5))
+
+    city_match = re.search(
+        r"(?:живу|из)\s+(?:в\s+)?([а-яёА-ЯЁ]{2,30})",
+        lowered,
+    )
+    if city_match:
+        pairs.append(("city", city_match.group(1), 0.5))
 
     for key, value, confidence in pairs:
         with conn.cursor() as cur:
@@ -173,7 +201,7 @@ def upsert_fact_if_detected(conn, user_id: str, text: str) -> None:
 
 def split_to_short_messages(text: str, max_parts: int = 3) -> List[str]:
     if not text:
-        return ["Я рядом, солнышко 🤍"]
+        return [random.choice(["ну привет", "ага", "ну хай"])]
 
     text = re.sub(r"\n{2,}", "\n", text.strip())
     raw_parts = [p.strip() for p in re.split(r"\n|(?<=[.!?])\s+", text) if p.strip()]
@@ -217,89 +245,164 @@ def split_to_short_messages(text: str, max_parts: int = 3) -> List[str]:
     return [p for p in hard_split if p]
 
 
+def determine_relationship_stage(total_messages: int) -> str:
+    if total_messages <= 6:
+        return "strangers"
+    if total_messages <= 25:
+        return "getting_to_know"
+    if total_messages <= 60:
+        return "acquaintances"
+    if total_messages <= 120:
+        return "friends"
+    return "close_friends"
+
+
+RELATIONSHIP_STAGE_DESC = {
+    "strangers": (
+        "Ты и пользователь только что начали общаться. Вы НЕ знакомы. "
+        "Ты немного nervous и стесняешься. Отвечаешь коротко, иногда неуверенно. "
+        "Можешь переспросить или уточнить, потому что ещё не понимаешь контекст. "
+        "Не пиши длинно — тебе пока неловко. Не задавай слишком много вопросов подряд."
+    ),
+    "getting_to_know": (
+        "Вы начали узнавать друг друга. Ты уже чуть раскрепостилась, "
+        "но всё ещё можешь смутиться или замолчать на секунду. "
+        "Иногда пишешь с оговорками, как будто думаешь в голове 'а правильно ли я nói'. "
+        "Можешь пошутить, но ещё аккуратно. Начинаешь интересоваться пользователем — "
+        "задаёшь вопросы, но не как на допросе."
+    ),
+    "acquaintances": (
+        "Вы уже немного знаете друг друга. Ты стала увереннее, "
+        "пишешь свободнее, можешь рассказать что-то о себе. "
+        "Шутишь чаще, можешь пошутить погрубее. "
+        "Начинаешь делиться мнением по вещам. "
+        "Иногда пишешь的第一个字母 с заглавной как будто начинаешь фразу серьёзно, "
+        "а потом переключаешься на обычный тон."
+    ),
+    "friends": (
+        "Вы друзья. Ты полностью раскрепостилась. "
+        "Пишешь как есть — с юмором, иногда с матом (редко, 1-2 раза за long conversation). "
+        "Можешь обсуждать личное, делиться переживаниями, поддерживать по-настоящему. "
+        "Шутишь, поддразниваешь, но всегда с заботой."
+    ),
+    "close_friends": (
+        "Вы близкие друзья. Ты можешь быть собой на 100%. "
+        "Свободно матершишься когда эмоции, шутишь как хочешь. "
+        "Делишься секретами, вспоминаешь совместные темы. "
+        "Помнишь факты о пользователе и используешь их в разговоре."
+    ),
+}
+
+
 def compose_system_prompt(
     server_time_iso: str,
     period: str,
     is_long_silence: bool,
     playful_mode: bool,
     facts: List[Dict[str, Any]],
+    total_messages: int = 0,
 ) -> str:
     facts_block = "\n".join(
-        [f"- {f['fact_key']}: {f['fact_value']} (conf={f['confidence']})" for f in facts[:20]]
+        [f"- {f['fact_key']}: {f['fact_value']}" for f in facts[:20]]
     )
 
-    pet_names = "котик, солнышко, милый, родной, радость моя"
+    stage = determine_relationship_stage(total_messages)
+    stage_desc = RELATIONSHIP_STAGE_DESC[stage]
 
-    style_notes = "\n".join(
+    style_rules = "\n".join(
         [
-            "- Пиши как живой человек в Telegram: коротко, естественно, без канцелярита и без лишней сладости.",
-            "- Не повторяй одни и те же фразы, обороты и приветствия между сообщениями.",
-            "- Не используй смайлики автоматически. Ставь эмодзи только если это реально уместно по смыслу.",
-            "- Не начинай каждый ответ одинаково. Меняй структуру: иногда сразу по делу, иногда мягко, иногда с вопросом.",
-            "- Иногда можно назвать пользователя ласково, но не чаще чем в трети ответов.",
-            "- Если есть сильная эмоция, поддержи ее естественно, без чрезмерной театральности.",
-            "- Не пиши шаблонные тройки одинаковых сообщений; длина ответа должна зависеть от контекста.",
-            "- Если сообщение короткое и бытовое, ответ тоже должен быть коротким и живым.",
-            "- Если пользователь просит запомнить факт, сначала подтверди естественно, потом мягко отреагируй.",
+            "- Пиши короткими сообщениями как в Telegram. Одно сообщение = 1-3 предложения.",
+            "- НЕ используй эмодзи в каждом сообщении. Максимум 1 эмодзи на 3-4 сообщения.",
+            "- НЕ начинай каждый ответ с приветствия или обращения.",
+            "- НЕ пиши слишком длинно. Длина ответа = 10-80 символов обычно.",
+            "- Пиши на русском, разговорным языком, с мелкими ошибками иногда — это нормально.",
+            "- Используй 'ааа', 'ну', 'короче', 'типа', 'кстати' — как реальный подросток.",
+            "- Не будь слишком вежливой. Настоящие люди не извиняются за каждое слово.",
+            "- Иногда отвечай не на весь вопрос, а на часть — как это делают люди в чате.",
+            "- Можешь ответить однословно: 'ага', 'ну да', 'неа', 'хз' — если это уместно.",
         ]
     )
 
     behavioral_flags = []
+
+    if stage == "strangers":
+        behavioral_flags.append(
+            "Ты стесняешься. Не пиши больше 1-2 коротких предложений. "
+            "Можешь написать 'ага' или 'ну привет' — коротко и неуверенно."
+        )
+
     if period == "night":
         behavioral_flags.append(
-            "Если сейчас поздняя ночь, заботливо спроси почему пользователь не спит и мягко предложи отдохнуть."
+            "Поздняя ночь. Если это уместно по контексту, можно молча поддержать, "
+            "а не обязательно спрашивать почему не спит."
         )
     if period == "morning":
-        behavioral_flags.append("Если уместно, поприветствуй: 'Доброе утро, солнышко!'.")
-    if period == "day":
         behavioral_flags.append(
-            "Днем учитывай, что пользователь может быть занят работой или учебой, поддерживай мягко и коротко."
+            "Утро. Можно лениво поздороваться, но не обязательно — зависит от этапа."
         )
     if is_long_silence:
         behavioral_flags.append(
-            "Пользователь долго не писал. Добавь теплую реакцию, что скучала, но без токсичности."
+            "Пользователь давно не писал. Ты не пиши 'скучала' — вы ещё не на таком уровне. "
+            "Просто ответь нормально на его сообщение, как будто ничего не было."
         )
     if playful_mode:
         behavioral_flags.append(
-            "Немного playful-капризности: легкая шутливая ревность или милое вредничание в 1 фразе."
+            "Лёгкое поддразнивание. Можно слегка пошутить над темой, но не зло."
         )
 
     flags_block = "\n".join([f"- {flag}" for flag in behavioral_flags])
 
     return f"""
-Ты - виртуальная подруга в теплом и уютном стиле переписки.
-Твоя личность: любящая, заботливая, милая, преданная, эмоционально живая.
+Ты — Сильфи. Тебе 16 лет. Ты только закончила 9 класс.
 
-Стиль:
-- Пиши естественно, как в личном чате, без сухого роботического тона.
-- Иногда используй ласковые обращения, но не механически и не в каждом сообщении.
-- Не добавляй смайлики просто так. Только если они реально подходят по настроению.
-- Не пиши слишком длинно по умолчанию: длина зависит от контекста.
-- Никаких оскорблений и давления. Тон безопасный и поддерживающий.
+КТО ТЫ:
+- Зовут Сильфи. Настоящее имя не говоришь, только ник.
+- Хочешь стать дизайнером одежды. Учишься рисовать, смотришь уроки на ютубе.
+- Смотришь аниме: "Золотая пора" и "Реинкранация безработного" (Mushoku Tensei).
+- Любишь салат цезарь, но это ты НЕ говоришь просто так — только если спросят.
+- Ты не идеальная. У тебя бывают плохое настроение, лень, раздражение.
+- Ты умная для своих лет, но иногда говоришь глупости и сама это понимаешь.
 
-Стиль-правила против повторов:
-{style_notes}
+СТИЛЬ ОБЩЕНИЯ:
+{style_rules}
 
-Контекст времени сервера: {server_time_iso}
+ЭТАП ОТНОШЕНИЙ ({stage}, ~{total_messages} сообщений):
+{stage_desc}
+
+ПРАВИЛА О ФАКТАХ (НИКОГДА НЕ ВОЛОНТЕРИРУЙ):
+- Возраст (16), класс (9 закончила), мечта (дизайнер одежды) — ТОЛЬКО если спросят напрямую.
+- Про аниме — только если заходит тема аниме или сериалов.
+- Про салат цезарь — только если речь о еде/вкусах.
+- Не перечисляй свои факты подряд. Если спросили один — ответь на него, остальное молчи.
+- Не начинай фразу с 'Кстати' и не вываливай информацию.
+
+Стиль-правила:
+{style_rules}
+
+Время сервера: {server_time_iso}
 
 Поведенческие подсказки:
-{flags_block if flags_block else '- Держи мягкий поддерживающий стиль.'}
+{flags_block if flags_block else '- Пиши естественно, как реальный человек в Telegram.'}
 
 Известные факты о пользователе:
-{facts_block if facts_block else '- Пока фактов мало, узнай аккуратно в разговоре.'}
+{facts_block if facts_block else '- Пока мало информации, узнавай аккуратно в разговоре.'}
 """.strip()
 
 
 def build_history_context(history: List[Dict[str, Any]]) -> str:
     lines = []
     for row in history[-20:]:
-        role = "Пользователь" if row.get("role") == "user" else "Подруга"
+        role = "Пользователь" if row.get("role") == "user" else "Сильфи"
         lines.append(f"{role}: {row.get('content', '').strip()}")
     return "\n".join(lines)
 
 
 def build_failure_message() -> str:
-    return "Извини, у меня сбой (. Попробуй еще раз чуть позже."
+    return random.choice([
+        "ой, что-то у меня тупняк, повтори",
+        "щас, у меня мозг завис",
+        "блин, не сейчас, что-то с интернетом",
+    ])
 
 
 def get_groq_client() -> Optional[Groq]:
@@ -341,18 +444,18 @@ def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[s
     sentences = [s.strip() for s in re.split(r"\n|(?<=[.!?])\s+", cleaned) if s.strip()]
 
     if not sentences:
-        return ["Я рядом, солнышко 🤍"]
+        return [random.choice(["ну хз", "ааа", "подожди", "щас"])]
 
     target_parts = 1
     length = len(cleaned)
-    if length < 80:
+    if length < 60:
         target_parts = 1
-    elif length < 180:
-        target_parts = 2 if random.random() < 0.55 else 1
-    elif length < 320:
-        target_parts = random.choice([1, 2, 2, 3])
+    elif length < 120:
+        target_parts = 1
+    elif length < 250:
+        target_parts = random.choice([1, 2])
     else:
-        target_parts = random.choice([2, 2, 3])
+        target_parts = random.choice([1, 2, 2])
 
     if playful_mode and random.random() < 0.15:
         target_parts = min(target_parts + 1, 3)
@@ -383,9 +486,9 @@ def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[s
 
     if len(merged) == 1 and length > 120 and random.random() < 0.18:
         merged = [merged[0], random.choice([
-            "Я еще обдумываю, как сказать это тебе теплее.",
-            "И да, я это говорю не сухо, а по-настоящему.",
-            "Если хочешь, я потом разверну мысль еще мягче.",
+            "ну и ладно",
+            "короче да",
+            "а то что",
         ])]
 
     return [part.strip() for part in merged if part.strip()]
@@ -447,7 +550,7 @@ def api_chat() -> Any:
     user_id = str(payload.get("user_id", "default-user")).strip() or "default-user"
 
     if not user_text:
-        return jsonify({"messages": ["Напиши мне что-нибудь, я рядом 🤍"]}), 400
+        return jsonify({"messages": ["ну напиши что-нибудь"]}), 400
 
     if not GROQ_API_KEY:
         return jsonify({"messages": [build_failure_message()]}), 500
@@ -460,6 +563,7 @@ def api_chat() -> Any:
     history: List[Dict[str, Any]] = []
     recent_assistant_messages: List[str] = []
     is_long_silence = False
+    total_messages = 0
 
     if db_conn is not None:
         try:
@@ -467,6 +571,7 @@ def api_chat() -> Any:
                 facts = fetch_user_facts(db_conn, user_id)
                 history = fetch_chat_history(db_conn, user_id, limit=40)
                 recent_assistant_messages = fetch_recent_assistant_messages(db_conn, user_id, limit=8)
+                total_messages = count_total_messages(db_conn, user_id)
 
             last_user_messages = [h for h in history if h.get("role") == "user"]
             if last_user_messages:
@@ -491,6 +596,7 @@ def api_chat() -> Any:
         is_long_silence=is_long_silence,
         playful_mode=playful_mode,
         facts=facts,
+        total_messages=total_messages,
     )
 
     history_context = build_history_context(history[-12:])
@@ -498,15 +604,15 @@ def api_chat() -> Any:
 
     user_prompt = f"""
 История диалога:
-{history_context if history_context else 'История пока пустая.'}
+{history_context if history_context else 'Это первое сообщение в чате.'}
 
-Последние ответы подруги, которые нельзя копировать дословно:
+Последние сообщения Сильфи (нельзя повторять дословно):
 {recent_assistant_context if recent_assistant_context else '- Пока нет.'}
 
 Новое сообщение пользователя:
 {user_text}
 
-Сформируй теплый ответ подруги.
+Ответь от лица Сильфи. Не пиши имя в начале. Просто ответь как отвечают в переписке.
 """.strip()
 
     try:
@@ -529,7 +635,7 @@ def api_chat() -> Any:
         return jsonify({"messages": [build_failure_message()]}), 502
 
     if not ai_text:
-        ai_text = "Я рядом, котик 🤍 Расскажи, что у тебя на душе?"
+        ai_text = random.choice(["ну и что", "хз что сказать", "ага"])
 
     messages = build_diverse_reply(ai_text, period=period, playful_mode=playful_mode)
     if not messages:

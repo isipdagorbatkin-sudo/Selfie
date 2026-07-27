@@ -60,10 +60,6 @@ function updateStatusLine() {
   statusLineEl.textContent = formatLastSeen(delta);
 }
 
-function chooseRandom(list) {
-  return list[Math.floor(Math.random() * list.length)];
-}
-
 function normalizeAiMessages(messages) {
   return messages
     .map((msg) => String(msg || "").trim())
@@ -185,7 +181,7 @@ formEl.addEventListener("submit", async (event) => {
   try {
     await sendMessage(text);
   } catch (error) {
-    await showAiMessagesWithTyping(["Ой, у меня сбой связи... но я уже снова рядом ✨"]);
+    await showAiMessagesWithTyping(["Извини, у меня сбой ("]);
   }
 });
 
@@ -216,7 +212,5 @@ if ("serviceWorker" in navigator) {
 }
 
 loadHistory().then(() => {
-  if (!chatEl.children.length) {
-    addBubble("Я здесь. Напиши что-нибудь, и я подхвачу разговор.", "ai");
-  }
+  updateStatusLine();
 });

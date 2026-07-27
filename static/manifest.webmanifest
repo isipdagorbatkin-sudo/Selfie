@@ -1,15 +1,15 @@
 {
-  "name": "Cozy AI Girlfriend",
-  "short_name": "CozyGF",
+  "name": "Сильфи",
+  "short_name": "Сильфи",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#1c1411",
   "theme_color": "#2b1e1a",
   "icons": [
     {
-      "src": "/static/icons/icon.svg",
+      "src": "/static/icons/avatar.jpg",
       "sizes": "512x512",
-      "type": "image/svg+xml",
+      "type": "image/jpeg",
       "purpose": "any"
     }
   ]

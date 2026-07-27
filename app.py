@@ -5,20 +5,17 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template, request
-from gigachat import GigaChat
+from groq import Groq
 from psycopg import connect
 from psycopg.rows import dict_row
 
 
 app = Flask(__name__)
 
-GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS", "")
-GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-GIGACHAT_MODEL = os.environ.get("GIGACHAT_MODEL", "GigaChat")
-GIGACHAT_VERIFY_SSL_CERTS = os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "1") == "1"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 APP_TIMEZONE_OFFSET = int(os.environ.get("APP_TIMEZONE_OFFSET", "3"))
-ENABLE_LOCAL_FALLBACK = os.environ.get("ENABLE_LOCAL_FALLBACK", "1") == "1"
 
 
 def get_db_connection():
@@ -235,7 +232,7 @@ def compose_system_prompt(
 
     style_notes = "\n".join(
         [
-            "- Пиши как живой человек, с естественными паузами и короткими/средними репликами.",
+            "- Пиши как живой человек в Telegram: коротко, естественно, без канцелярита и без лишней сладости.",
             "- Не повторяй одни и те же фразы, обороты и приветствия между сообщениями.",
             "- Не используй смайлики автоматически. Ставь эмодзи только если это реально уместно по смыслу.",
             "- Не начинай каждый ответ одинаково. Меняй структуру: иногда сразу по делу, иногда мягко, иногда с вопросом.",
@@ -301,178 +298,42 @@ def build_history_context(history: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
-    lower = user_text.lower().strip()
-    if not lower:
-        lower = ""
+def build_failure_message() -> str:
+    return "Извини, у меня сбой (. Попробуй еще раз чуть позже."
 
-    is_greeting = any(word in lower for word in ["привет", "ку", "хай", "здрав", "салют"])
-    is_short = len(lower) <= 6
-    is_question = "?" in user_text or any(word in lower for word in ["как", "что", "почему", "зачем", "когда", "где"])
-    is_memory = any(word in lower for word in ["запомни", "помни", "не забудь", "запиши"])
-    is_negative = any(word in lower for word in ["плохо", "груст", "устал", "трев", "страш", "одинок", "бесит", "задолб"])
 
-    first_line_pool = {
-        "greeting": [
-            "Привет. Я здесь",
-            "О, ты написал",
-            "Да, я рядом",
-            "Слышу тебя",
+def get_groq_client() -> Optional[Groq]:
+    if not GROQ_API_KEY:
+        return None
+    return Groq(api_key=GROQ_API_KEY)
+
+
+def generate_with_groq(system_prompt: str, user_prompt: str) -> str:
+    client = get_groq_client()
+    if client is None:
+        raise RuntimeError("Groq client is not configured")
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        "short": [
-            "Поняла",
-            "Ага, вижу тебя",
-            "Есть",
-            "Я здесь",
-        ],
-        "question": [
-            "Сейчас отвечу по-человечески",
-            "Давай разберем это спокойно",
-            "Могу ответить прямо",
-            "Сейчас подумаю вместе с тобой",
-        ],
-        "memory": [
-            "Запомнила",
-            "Хорошо, сохранила это для себя",
-            "Приняла, не потеряю",
-            "Да, это держу в голове",
-        ],
-        "negative": [
-            "Слышу, что тебе не очень",
-            "Похоже, тебе тяжело",
-            "Я рядом, не надо это тащить одному",
-            "Это звучит непросто",
-        ],
-        "default": [
-            "Поняла тебя",
-            "Я рядом и слушаю",
-            "Думаю над тем, что ты сказал",
-            "Окей, давай честно",
-        ],
-    }
+        temperature=1.0,
+        top_p=0.95,
+        frequency_penalty=0.55,
+        presence_penalty=0.35,
+        max_tokens=500,
+    )
 
-    middle_pool = [
-        "Расскажи чуть подробнее, чтобы я не гадала.",
-        "Могу быть мягкой, но лучше скажу прямо.",
-        "Без лишней драматичности, но с вниманием.",
-        "Я не буду отвечать по заготовке, сейчас разберу смысл.",
-        "Постараюсь ответить без шаблонов и без суеты.",
-    ]
-
-    closing_pool = [
-        "Если хочешь, продолжим и я подстроюсь под тебя.",
-        "Могу еще раз по-другому это сказать, если нужно.",
-        "Если я не туда попала, поправь меня.",
-        "И да, я тут надолго, не исчезаю.",
-        "Продолжай, я подхвачу.",
-        "Если надо, отвечу короче или точнее.",
-    ]
-
-    if is_negative:
-        first = random.choice(first_line_pool["negative"])
-        middle = random.choice([
-            "Сейчас без лишних смайлов: просто побуду рядом и не обесценю то, что ты чувствуешь.",
-            "Давай без давления, шаг за шагом.",
-            "Сначала просто признаю: тебе правда нелегко.",
-        ])
-    elif is_memory:
-        first = random.choice(first_line_pool["memory"])
-        middle = random.choice([
-            "Я это учту и не буду терять такой момент в переписке.",
-            "Хорошо, буду держать это в памяти по ходу разговора.",
-            "Приняла. Если потом вернемся к теме, я не потеряюсь.",
-        ])
-    elif is_greeting:
-        first = random.choice(first_line_pool["greeting"])
-        middle = random.choice([
-            "Как сам вообще?",
-            "Что у тебя сейчас по настроению?",
-            "Какой у тебя вайб сегодня?",
-        ])
-    elif is_short:
-        first = random.choice(first_line_pool["short"])
-        middle = random.choice([
-            "Ответлю нормально, без воды.",
-            "Могу быть короткой и по делу.",
-            "Не растягиваю, говорю по сути.",
-        ])
-    elif is_question:
-        first = random.choice(first_line_pool["question"])
-        middle = random.choice(middle_pool)
-    else:
-        first = random.choice(first_line_pool["default"])
-        middle = random.choice(middle_pool)
-
-    if period == "night":
-        middle = random.choice([
-            "Уже поздно, так что отвечу спокойно и без лишнего шума.",
-            "Ночной режим: без сахара, без пафоса, по-человечески.",
-            "Сейчас можно говорить тише и теплее.",
-        ])
-    elif period == "morning":
-        middle = random.choice([
-            "Утром лучше коротко и бодро.",
-            "С утра без перегруза, но с вниманием.",
-            "Доброе утро, я на связи и без спешки.",
-        ])
-
-    if is_question:
-        closing = random.choice([
-            "Давай уточни, и я отвечу точнее.",
-            "Если хочешь, я разверну мысль глубже.",
-            "Продолжай, мне важно не промахнуться.",
-        ])
-    else:
-        closing = random.choice(closing_pool)
-
-    result = [first, middle, closing]
-    if random.random() < 0.32:
-        result = [result[0], result[1]]
-    if random.random() < 0.16:
-        result = [result[0]]
-
-    if random.random() < 0.2 and not is_negative:
-        result[-1] = random.choice([
-            result[-1],
-            f"{result[-1]} И без лишней мишуры.",
-            f"{result[-1]} Просто честно.",
-        ])
-
-    return result
-
-
-def generate_with_gigachat(system_prompt: str, user_prompt: str) -> str:
-    if not GIGACHAT_CREDENTIALS:
-        raise RuntimeError("GigaChat client is not configured")
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    with GigaChat(
-        credentials=GIGACHAT_CREDENTIALS,
-        scope=GIGACHAT_SCOPE,
-        verify_ssl_certs=GIGACHAT_VERIFY_SSL_CERTS,
-    ) as client:
-        try:
-            response = client.chat(
-                messages,
-                model=GIGACHAT_MODEL,
-            )
-        except TypeError:
-            response = client.chat(
-                messages=messages,
-                model=GIGACHAT_MODEL,
-            )
-
-    try:
-        message = response.choices[0].message
-        if isinstance(message, dict):
-            return str(message.get("content", "")).strip()
-        return str(getattr(message, "content", "")).strip()
-    except Exception:
-        return str(response).strip()
+    choice = response.choices[0]
+    message = getattr(choice, "message", None)
+    if message is None:
+        return ""
+    content = getattr(message, "content", None)
+    if content is None and isinstance(message, dict):
+        content = message.get("content")
+    return str(content or "").strip()
 
 
 def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[str]:
@@ -588,8 +449,8 @@ def api_chat() -> Any:
     if not user_text:
         return jsonify({"messages": ["Напиши мне что-нибудь, я рядом 🤍"]}), 400
 
-    if gigachat_client is None:
-        return jsonify({"messages": ["Не настроен GIGACHAT_CREDENTIALS в переменных окружения."]}), 500
+    if not GROQ_API_KEY:
+        return jsonify({"messages": [build_failure_message()]}), 500
 
     db_conn = get_db_connection()
     server_now = datetime.now(timezone.utc)
@@ -649,48 +510,23 @@ def api_chat() -> Any:
 """.strip()
 
     try:
-        ai_text = generate_with_gigachat(system_prompt, user_prompt)
+        ai_text = generate_with_groq(system_prompt, user_prompt)
     except Exception as ex:
         err_text = str(ex)
         is_quota = "quota" in err_text.lower() or "limit" in err_text.lower() or "429" in err_text
 
-        if ENABLE_LOCAL_FALLBACK and is_quota:
-            fallback_messages = build_local_fallback_messages(user_text, period)
-
-            if recent_assistant_messages:
-                fallback_messages = [
-                    msg
-                    for msg in fallback_messages
-                    if msg not in recent_assistant_messages[-4:]
-                ] or fallback_messages
-
-            if db_conn is not None:
-                try:
-                    with db_conn:
-                        save_message(db_conn, user_id, "user", user_text)
-                        for msg in fallback_messages:
-                            save_message(db_conn, user_id, "assistant", msg)
-                        upsert_fact_if_detected(db_conn, user_id, user_text)
-                except Exception:
-                    pass
-                finally:
-                    db_conn.close()
-
-            return jsonify(
-                {
-                    "messages": fallback_messages,
-                    "meta": {
-                        "period": period,
-                        "playful_mode": False,
-                        "server_time": server_now.isoformat(),
-                        "fallback": "local_quota",
-                    },
-                }
-            )
-
         if db_conn is not None:
-            db_conn.close()
-        return jsonify({"messages": ["Временный сбой ответа, попробуй через минутку 🤍"]}), 502
+            try:
+                with db_conn:
+                    save_message(db_conn, user_id, "user", user_text)
+                    save_message(db_conn, user_id, "assistant", build_failure_message())
+                    upsert_fact_if_detected(db_conn, user_id, user_text)
+            except Exception:
+                pass
+            finally:
+                db_conn.close()
+
+        return jsonify({"messages": [build_failure_message()]}), 502
 
     if not ai_text:
         ai_text = "Я рядом, котик 🤍 Расскажи, что у тебя на душе?"

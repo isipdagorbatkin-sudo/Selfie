@@ -6,10 +6,9 @@ const statusLineEl = document.getElementById("statusLine");
 
 const USER_ID_KEY = "cozy_ai_user_id";
 const LAST_USER_ACTIVITY_KEY = "cozy_last_user_activity_at";
-const CHAT_SEEN_MESSAGE_IDS_KEY = "cozy_seen_message_ids";
+const LOCAL_HISTORY_KEY = "cozy_local_history";
 
 let lastUserActivityAt = Number(localStorage.getItem(LAST_USER_ACTIVITY_KEY) || "0");
-let seenMessageIds = new Set(JSON.parse(localStorage.getItem(CHAT_SEEN_MESSAGE_IDS_KEY) || "[]"));
 
 function getOrCreateUserId() {
   const existing = localStorage.getItem(USER_ID_KEY);
@@ -18,10 +17,6 @@ function getOrCreateUserId() {
   const newId = `user-${crypto.randomUUID()}`;
   localStorage.setItem(USER_ID_KEY, newId);
   return newId;
-}
-
-function persistSeenMessageIds() {
-  localStorage.setItem(CHAT_SEEN_MESSAGE_IDS_KEY, JSON.stringify([...seenMessageIds]));
 }
 
 function persistLastUserActivity() {
@@ -58,6 +53,28 @@ function updateStatusLine() {
 
   const delta = Date.now() - lastUserActivityAt;
   statusLineEl.textContent = formatLastSeen(delta);
+}
+
+function getLocalHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveToLocalHistory(role, content) {
+  const history = getLocalHistory();
+  history.push({
+    id: "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+    role: role,
+    content: content,
+    created_at: new Date().toISOString(),
+  });
+  if (history.length > 300) {
+    history.splice(0, history.length - 300);
+  }
+  localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history));
 }
 
 function normalizeAiMessages(messages) {
@@ -132,37 +149,59 @@ async function sendMessage(text) {
 
   if (!response.ok) {
     const fallback = (data.messages && data.messages[0]) || "Ошибка сервера";
+    saveToLocalHistory("user", text);
+    saveToLocalHistory("assistant", fallback);
     await showAiMessagesWithTyping([fallback]);
     return;
   }
 
   const aiMessages = normalizeAiMessages(Array.isArray(data.messages) ? data.messages : ["Я тут"]);
+  saveToLocalHistory("user", text);
+  for (const m of aiMessages) {
+    saveToLocalHistory("assistant", m);
+  }
   await showAiMessagesWithTyping(aiMessages);
 }
 
 async function loadHistory() {
   const userId = getOrCreateUserId();
-  const response = await fetch(`/api/history?user_id=${encodeURIComponent(userId)}`);
-  if (!response.ok) return;
+  let serverMessages = [];
 
-  const data = await response.json();
-  const messages = Array.isArray(data.messages) ? data.messages : [];
-
-  chatEl.innerHTML = "";
-  seenMessageIds = new Set();
-
-  for (const message of messages) {
-    if (!message || !message.id) continue;
-    seenMessageIds.add(message.id);
-    addBubble(message.content, message.role === "user" ? "user" : "ai");
+  try {
+    const response = await fetch(`/api/history?user_id=${encodeURIComponent(userId)}`);
+    if (response.ok) {
+      const data = await response.json();
+      serverMessages = Array.isArray(data.messages) ? data.messages : [];
+    }
+  } catch {
+    // server unavailable
   }
 
-  persistSeenMessageIds();
-  if (messages.length > 0 && data.last_user_created_at) {
-    const parsed = Date.parse(data.last_user_created_at);
-    if (!Number.isNaN(parsed)) {
-      lastUserActivityAt = parsed;
-      persistLastUserActivity();
+  let messages = [];
+
+  if (serverMessages.length > 0) {
+    messages = serverMessages;
+  } else {
+    messages = getLocalHistory();
+  }
+
+  chatEl.innerHTML = "";
+
+  for (const message of messages) {
+    if (!message) continue;
+    const content = message.content;
+    const role = message.role === "user" ? "user" : "ai";
+    if (content) addBubble(content, role);
+  }
+
+  if (messages.length > 0) {
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg && lastMsg.created_at) {
+      const parsed = Date.parse(lastMsg.created_at);
+      if (!Number.isNaN(parsed)) {
+        lastUserActivityAt = parsed;
+        persistLastUserActivity();
+      }
     }
   }
 
@@ -181,6 +220,8 @@ formEl.addEventListener("submit", async (event) => {
   try {
     await sendMessage(text);
   } catch (error) {
+    saveToLocalHistory("user", text);
+    saveToLocalHistory("assistant", "Извини, у меня сбой (");
     await showAiMessagesWithTyping(["Извини, у меня сбой ("]);
   }
 });
@@ -211,15 +252,14 @@ if ("serviceWorker" in navigator) {
   });
 }
 
-loadHistory().then(() => {
-  updateStatusLine();
-});
+loadHistory();
 
 const lightbox = document.getElementById("lightbox");
 const lightboxImg = document.getElementById("lightboxImg");
 const lightboxClose = lightbox.querySelector(".lightbox-close");
+const avatarImg = document.getElementById("animeAvatar");
 
-document.getElementById("animeAvatar").addEventListener("click", () => {
+avatarImg.addEventListener("click", () => {
   lightboxImg.src = "/static/icons/avatar.jpg";
   lightbox.classList.add("open");
 });

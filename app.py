@@ -11,7 +11,7 @@ from duckduckgo_search import DDGS
 from psycopg import connect
 from psycopg.rows import dict_row
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 
 app = Flask(__name__)
 
@@ -261,21 +261,25 @@ def get_stage(msg_count: int) -> str:
 
 
 def fetch_live_image(search_query: str) -> Optional[str]:
-    """Ищет картинку в DuckDuckGo Images, возвращает URL случайной из топ-5."""
+    """Ищет картинку в DuckDuckGo Images с retry."""
     log(f"fetch_live_image: searching for '{search_query}'")
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.images(search_query, max_results=5))
-        if not results:
-            log("fetch_live_image: no results found")
-            return None
-        chosen = random.choice(results)
-        url = chosen.get("image") or chosen.get("thumbnail") or chosen.get("url", "")
-        log(f"fetch_live_image: picked url={url[:80]}")
-        return url if url else None
-    except Exception as e:
-        log(f"fetch_live_image error: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.images(search_query, max_results=5))
+            if not results:
+                log("fetch_live_image: no results found")
+                return None
+            chosen = random.choice(results)
+            url = chosen.get("image") or chosen.get("thumbnail") or chosen.get("url", "")
+            log(f"fetch_live_image: picked url={url[:100]}")
+            return url if url else None
+        except Exception as e:
+            log(f"fetch_live_image attempt {attempt + 1} error: {e}")
+            if attempt < 2:
+                import time
+                time.sleep(1.5 * (attempt + 1))
+    return None
 
 
 def parse_image_tag(text: str) -> Tuple[str, Optional[str]]:
@@ -457,7 +461,17 @@ def call_groq(messages: List[Dict[str, Any]], has_image: bool = False) -> str:
 
     if getattr(message, "tool_calls", None):
         log(f"call_groq: model requested {len(message.tool_calls)} tool call(s)")
-        messages_with_tools = list(messages)
+        messages_with_tools = []
+        for m in messages:
+            if isinstance(m.get("content"), list):
+                text_only = " ".join(
+                    part.get("text", "") for part in m["content"]
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+                messages_with_tools.append({"role": m["role"], "content": text_only})
+            else:
+                messages_with_tools.append(dict(m))
+
         messages_with_tools.append({
             "role": "assistant",
             "content": getattr(message, "content", None) or "",

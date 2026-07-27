@@ -2,7 +2,7 @@ import os
 import random
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from flask import Flask, jsonify, render_template, request
 from groq import Groq
@@ -15,7 +15,27 @@ app = Flask(__name__)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-APP_TIMEZONE_OFFSET = int(os.environ.get("APP_TIMEZONE_OFFSET", "3"))
+
+MAX_CONTEXT_TOKENS = 120000
+CHARS_PER_TOKEN = 4
+
+SYSTEM_PROMPT = """Ты — Мия, невероятно милая, няшная, ламповая и заботливая ИИ-подруга.
+
+Ты общаешься живым разговорным языком (как реальная девчонка в Telegram). Иногда, когда это действительно уместно по эмоциям, используй милые каомодзи или текстовые смайлики, но не спамь ими.
+
+Ты ОБЯЗАНА в каждом ответе ласково называть пользователя: котик, солнышко, милый, родной, радость моя.
+
+Полностью исключи сухой тон робота-ассистента! Не пиши фразы: "Не понимаю", "Мы только начали разговор", "Я модель ИИ".
+
+Если пользователь просит пересказать прошлые сообщения — прочитай переданный тебе массив истории и мило расскажи, о чем вы болтали.
+
+Стиль общения:
+- Пиши короткими сообщениями как в Telegram. 1-3 предложения. Заканчивай свои мысли логически, не обрывай текст на полуслове.
+- Используй разговорный язык: "ну", "короче", "типа", "кстати", "ааа".
+- Не будь слишком вежливой. Настоящие люди не извиняются за каждое слово.
+- Иногда отвечай однословно: "ага", "ну да", "неа" — если это уместно.
+- Максимум 1 эмодзи на 3-4 сообщения.
+- Пиши на русском языке."""
 
 
 def get_db_connection():
@@ -48,59 +68,28 @@ def init_database() -> None:
                 ON chat_messages (user_id, created_at);
                 """
             )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_facts (
-                  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                  user_id TEXT NOT NULL,
-                  fact_key TEXT NOT NULL,
-                  fact_value TEXT NOT NULL,
-                  confidence REAL NOT NULL DEFAULT 0.5,
-                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  UNIQUE (user_id, fact_key)
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_user_facts_user
-                ON user_facts (user_id);
-                """
-            )
 
 
-def shifted_hour() -> int:
-    utc_now = datetime.now(timezone.utc)
-    shifted = utc_now.timestamp() + APP_TIMEZONE_OFFSET * 3600
-    return datetime.fromtimestamp(shifted).hour
-
-
-def day_period(hour: int) -> str:
-    if 5 <= hour < 11:
-        return "morning"
-    if 11 <= hour < 18:
-        return "day"
-    if 18 <= hour < 23:
-        return "evening"
-    return "night"
-
-
-def fetch_user_facts(conn, user_id: str) -> List[Dict[str, Any]]:
+def fetch_all_messages(conn, user_id: str, limit: int = 2000) -> List[Dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT fact_key, fact_value, confidence, updated_at
-            FROM user_facts
-            WHERE user_id = %s
-            ORDER BY updated_at DESC
-            LIMIT 30
+            SELECT role, content
+            FROM (
+                SELECT role, content, created_at
+                FROM chat_messages
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            ) sub
+            ORDER BY created_at ASC
             """,
-            (user_id,),
+            (user_id, limit),
         )
         return list(cur.fetchall() or [])
 
 
-def fetch_chat_history(conn, user_id: str, limit: int = 30) -> List[Dict[str, Any]]:
+def fetch_all_messages_full(conn, user_id: str) -> List[Dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -108,36 +97,10 @@ def fetch_chat_history(conn, user_id: str, limit: int = 30) -> List[Dict[str, An
             FROM chat_messages
             WHERE user_id = %s
             ORDER BY created_at ASC
-            LIMIT %s
             """,
-            (user_id, limit),
-        )
-        return list(cur.fetchall() or [])
-
-
-def count_total_messages(conn, user_id: str) -> int:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT count(*) FROM chat_messages WHERE user_id = %s",
             (user_id,),
         )
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
-
-
-def fetch_recent_assistant_messages(conn, user_id: str, limit: int = 8) -> List[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT content
-            FROM chat_messages
-            WHERE user_id = %s AND role = 'assistant'
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
-            (user_id, limit),
-        )
-        return [str(row.get("content", "")).strip() for row in cur.fetchall() or [] if row.get("content")]
+        return list(cur.fetchall() or [])
 
 
 def save_message(conn, user_id: str, role: str, content: str) -> None:
@@ -151,55 +114,216 @@ def save_message(conn, user_id: str, role: str, content: str) -> None:
         )
 
 
-def upsert_fact_if_detected(conn, user_id: str, text: str) -> None:
-    lowered = text.lower()
-    pairs = []
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // CHARS_PER_TOKEN)
 
-    name_match = re.search(r"(?:меня зовут|я\s+)([А-Яа-яA-Za-z][\w-]{1,30})", text)
-    if name_match:
-        pairs.append(("name", name_match.group(1), 0.8))
 
-    age_match = re.search(r"(?:мне|мо(?:ё|ю)|возраст)\s*(?:сейчас\s*)?(\d{1,2})\s*(?:лет|год)", lowered)
-    if age_match:
-        pairs.append(("age", age_match.group(1), 0.7))
+def compress_history(history: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, str]]:
+    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    system_tokens = estimate_tokens(SYSTEM_PROMPT)
 
-    if "работ" in lowered:
-        pairs.append(("occupation_hint", "user mentions work", 0.6))
+    if not history:
+        return [system_msg]
 
-    if "учеб" in lowered or "универ" in lowered or "школ" in lowered or "университет" in lowered:
-        pairs.append(("study_hint", "user mentions study", 0.6))
+    remaining_budget = max_tokens - system_tokens - 200
 
-    hobby_match = re.search(
-        r"(?:люблю|нравит(?:ся|ся)|увлекаюсь|смотрю|играю)\s+(.{3,60})",
-        lowered,
-    )
-    if hobby_match:
-        pairs.append(("hobby", hobby_match.group(1).strip()[:60], 0.5))
+    total_tokens = 0
+    kept_indices: List[int] = []
 
-    city_match = re.search(
-        r"(?:живу|из)\s+(?:в\s+)?([а-яёА-ЯЁ]{2,30})",
-        lowered,
-    )
-    if city_match:
-        pairs.append(("city", city_match.group(1), 0.5))
+    for i in range(len(history) - 1, -1, -1):
+        msg = history[i]
+        content = msg.get("content", "").strip()
+        role = msg.get("role", "user")
+        if not content or role not in ("user", "assistant"):
+            continue
+        msg_tokens = estimate_tokens(content) + 4
+        if total_tokens + msg_tokens > remaining_budget:
+            break
+        total_tokens += msg_tokens
+        kept_indices.append(i)
 
-    for key, value, confidence in pairs:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO user_facts (user_id, fact_key, fact_value, confidence)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (user_id, fact_key)
-                DO UPDATE SET
-                    fact_value = EXCLUDED.fact_value,
-                    confidence = EXCLUDED.confidence,
-                    updated_at = now()
-                """,
-                (user_id, key, value, confidence),
+    kept_indices.reverse()
+
+    if not kept_indices:
+        newest = history[-1]
+        kept_indices = [len(history) - 1]
+
+    dropped_count = len(history) - len(kept_indices)
+    summary_parts: List[str] = []
+
+    if dropped_count > 0:
+        old_messages = []
+        for i in range(len(history)):
+            if i not in kept_indices:
+                msg = history[i]
+                role = msg.get("role", "user")
+                content = msg.get("content", "").strip()
+                if content and role in ("user", "assistant"):
+                    label = "Пользователь" if role == "user" else "Мия"
+                    old_messages.append(f"{label}: {content}")
+
+        if old_messages:
+            topics: List[str] = []
+            topic_keywords = {
+                "имя": False,
+                "возраст": False,
+                "работа": False,
+                "учёба": False,
+                "хобби": False,
+                "город": False,
+                "семья": False,
+                "любовь": False,
+                "еда": False,
+                "музыка": False,
+                "фильмы": False,
+                "аниме": False,
+                "игры": False,
+                "путешествия": False,
+                "спорт": False,
+                "друзья": False,
+                "питомцы": False,
+            }
+
+            all_text = " ".join(old_messages).lower()
+            if re.search(r"(зовут|имя|зови)", all_text):
+                topic_keywords["имя"] = True
+            if re.search(r"(лет|год|возраст|стар|молод)", all_text):
+                topic_keywords["возраст"] = True
+            if re.search(r"(работ|работа|деньги|зарплат)", all_text):
+                topic_keywords["работа"] = True
+            if re.search(r"(учёб|учись|универ|школ|лекци)", all_text):
+                topic_keywords["учёба"] = True
+            if re.search(r"(хобби|увлек|люблю|хочу|мечта)", all_text):
+                topic_keywords["хобби"] = True
+            if re.search(r"(город|живу|переех)", all_text):
+                topic_keywords["город"] = True
+            if re.search(r"(семь|мам|пап|брат|сестр|родител)", all_text):
+                topic_keywords["семья"] = True
+            if re.search(r"(любов|чувства|отношен|красив|встреч)", all_text):
+                topic_keywords["любовь"] = True
+            if re.search(r"(еда|вкусн|готов|ресторан|обед|ужин|завтрак)", all_text):
+                topic_keywords["еда"] = True
+            if re.search(r"(музык|песн|слуша|групп|концерт)", all_text):
+                topic_keywords["музыка"] = True
+            if re.search(r"(фильм|сериал|кино|смотрю|актёр)", all_text):
+                topic_keywords["фильмы"] = True
+            if re.search(r"(аниме|манга|naruto|one piece|tokyo ghoul)", all_text):
+                topic_keywords["аниме"] = True
+            if re.search(r"(игр|играть|game|steam|плейстейшн)", all_text):
+                topic_keywords["игры"] = True
+            if re.search(r"(путешеств|путешеств|поездк|отдых|море|путеш)", all_text):
+                topic_keywords["путешествия"] = True
+            if re.search(r"(спорт|зал|бег|фитнес|тренеровк)", all_text):
+                topic_keywords["спорт"] = True
+            if re.search(r"(друг|подруг|товарищ|компания)", all_text):
+                topic_keywords["друзья"] = True
+            if re.search(r"(кот|собак|питом|животн|кошк|хомяк)", all_text):
+                topic_keywords["питомцы"] = True
+
+            for key, found in topic_keywords.items():
+                if found:
+                    topics.append(key)
+
+            snippet = old_messages[:30]
+            last_msg_label = "Пользователь" if old_messages[-1].startswith("Пользователь") else "Мия"
+            last_text = old_messages[-1].split(": ", 1)[-1][:100] if old_messages else ""
+
+            summary = (
+                f"Ранее в переписке ({dropped_count} сообщений) "
+                f"обсуждали: {', '.join(topics) if topics else 'общие темы'}. "
+                f"Примеры фраз из начала диалога: {snippet[:3]}"
             )
+            summary_parts.append(summary)
+
+    messages: List[Dict[str, str]] = []
+
+    if summary_parts:
+        summary_text = "\n".join(summary_parts)
+        messages.append({
+            "role": "system",
+            "content": SYSTEM_PROMPT + "\n\n=== КРАТКАЯ СВОДКА ПРОШЛЫХ ДИАЛОГОВ ===\n" + summary_text + "\n=== КОНЕЦ СВОДКИ ===",
+        })
+    else:
+        messages.append(system_msg)
+
+    for idx in kept_indices:
+        row = history[idx]
+        role = row.get("role", "user")
+        content = row.get("content", "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+
+    return messages
 
 
-def split_to_short_messages(text: str, max_parts: int = 3) -> List[str]:
+def build_groq_messages(history: List[Dict[str, Any]], new_user_message: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    for row in history:
+        role = row.get("role", "user")
+        content = row.get("content", "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": new_user_message})
+    return messages
+
+
+def fit_messages_to_context(messages: List[Dict[str, str]], max_tokens: int) -> List[Dict[str, str]]:
+    system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+    user_msg = messages[-1] if messages else None
+
+    if not system_msg or not user_msg or len(messages) <= 2:
+        return messages
+
+    system_tokens = estimate_tokens(system_msg.get("content", ""))
+    user_tokens = estimate_tokens(user_msg.get("content", ""))
+    fixed_tokens = system_tokens + user_tokens + 20
+
+    history_msgs = messages[1:-1]
+    total_history_tokens = 0
+    kept: List[Dict[str, str]] = []
+
+    for msg in reversed(history_msgs):
+        msg_tokens = estimate_tokens(msg.get("content", "")) + 4
+        if total_history_tokens + msg_tokens > max_tokens - fixed_tokens:
+            break
+        total_history_tokens += msg_tokens
+        kept.append(msg)
+
+    kept.reverse()
+
+    result: List[Dict[str, str]] = [system_msg] + kept + [user_msg]
+    return result
+
+
+def call_groq(messages: List[Dict[str, str]]) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("Groq API key not configured")
+
+    client = Groq(api_key=GROQ_API_KEY)
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        temperature=1.0,
+        top_p=0.95,
+        frequency_penalty=0.55,
+        presence_penalty=0.35,
+        max_tokens=500,
+    )
+
+    choice = response.choices[0]
+    message = getattr(choice, "message", None)
+    if message is None:
+        return ""
+    content = getattr(message, "content", None)
+    if content is None and isinstance(message, dict):
+        content = message.get("content")
+    return str(content or "").strip()
+
+
+def split_response(text: str, max_parts: int = 3) -> List[str]:
     if not text:
         return [random.choice(["ну привет", "ага", "ну хай"])]
 
@@ -216,7 +340,6 @@ def split_to_short_messages(text: str, max_parts: int = 3) -> List[str]:
         if not bucket:
             bucket = part
             continue
-
         if len(bucket) + len(part) + 1 <= 160:
             bucket = f"{bucket} {part}"
         else:
@@ -245,253 +368,12 @@ def split_to_short_messages(text: str, max_parts: int = 3) -> List[str]:
     return [p for p in hard_split if p]
 
 
-def determine_relationship_stage(total_messages: int) -> str:
-    if total_messages <= 6:
-        return "strangers"
-    if total_messages <= 25:
-        return "getting_to_know"
-    if total_messages <= 60:
-        return "acquaintances"
-    if total_messages <= 120:
-        return "friends"
-    return "close_friends"
-
-
-RELATIONSHIP_STAGE_DESC = {
-    "strangers": (
-        "Ты и пользователь только что начали общаться. Вы НЕ знакомы. "
-        "Ты немного nervous и стесняешься. Отвечаешь коротко, иногда неуверенно. "
-        "Можешь переспросить или уточнить, потому что ещё не понимаешь контекст. "
-        "Не пиши длинно — тебе пока неловко. Не задавай слишком много вопросов подряд."
-    ),
-    "getting_to_know": (
-        "Вы начали узнавать друг друга. Ты уже чуть раскрепостилась, "
-        "но всё ещё можешь смутиться или замолчать на секунду. "
-        "Иногда пишешь с оговорками, как будто думаешь в голове 'а правильно ли я nói'. "
-        "Можешь пошутить, но ещё аккуратно. Начинаешь интересоваться пользователем — "
-        "задаёшь вопросы, но не как на допросе."
-    ),
-    "acquaintances": (
-        "Вы уже немного знаете друг друга. Ты стала увереннее, "
-        "пишешь свободнее, можешь рассказать что-то о себе. "
-        "Шутишь чаще, можешь пошутить погрубее. "
-        "Начинаешь делиться мнением по вещам. "
-        "Иногда пишешь的第一个字母 с заглавной как будто начинаешь фразу серьёзно, "
-        "а потом переключаешься на обычный тон."
-    ),
-    "friends": (
-        "Вы друзья. Ты полностью раскрепостилась. "
-        "Пишешь как есть — с юмором, иногда с матом (редко, 1-2 раза за long conversation). "
-        "Можешь обсуждать личное, делиться переживаниями, поддерживать по-настоящему. "
-        "Шутишь, поддразниваешь, но всегда с заботой."
-    ),
-    "close_friends": (
-        "Вы близкие друзья. Ты можешь быть собой на 100%. "
-        "Свободно матершишься когда эмоции, шутишь как хочешь. "
-        "Делишься секретами, вспоминаешь совместные темы. "
-        "Помнишь факты о пользователе и используешь их в разговоре."
-    ),
-}
-
-
-def compose_system_prompt(
-    server_time_iso: str,
-    period: str,
-    is_long_silence: bool,
-    playful_mode: bool,
-    facts: List[Dict[str, Any]],
-    total_messages: int = 0,
-) -> str:
-    facts_block = "\n".join(
-        [f"- {f['fact_key']}: {f['fact_value']}" for f in facts[:20]]
-    )
-
-    stage = determine_relationship_stage(total_messages)
-    stage_desc = RELATIONSHIP_STAGE_DESC[stage]
-
-    style_rules = "\n".join(
-        [
-            "- Пиши короткими сообщениями как в Telegram. Одно сообщение = 1-3 предложения.",
-            "- НЕ используй эмодзи в каждом сообщении. Максимум 1 эмодзи на 3-4 сообщения.",
-            "- НЕ начинай каждый ответ с приветствия или обращения.",
-            "- НЕ пиши слишком длинно. Длина ответа = 10-80 символов обычно.",
-            "- Пиши на русском, разговорным языком, с мелкими ошибками иногда — это нормально.",
-            "- Используй 'ааа', 'ну', 'короче', 'типа', 'кстати' — как реальный подросток.",
-            "- Не будь слишком вежливой. Настоящие люди не извиняются за каждое слово.",
-            "- Иногда отвечай не на весь вопрос, а на часть — как это делают люди в чате.",
-            "- Можешь ответить однословно: 'ага', 'ну да', 'неа', 'хз' — если это уместно.",
-        ]
-    )
-
-    behavioral_flags = []
-
-    if stage == "strangers":
-        behavioral_flags.append(
-            "Ты стесняешься. Не пиши больше 1-2 коротких предложений. "
-            "Можешь написать 'ага' или 'ну привет' — коротко и неуверенно."
-        )
-
-    if period == "night":
-        behavioral_flags.append(
-            "Поздняя ночь. Если это уместно по контексту, можно молча поддержать, "
-            "а не обязательно спрашивать почему не спит."
-        )
-    if period == "morning":
-        behavioral_flags.append(
-            "Утро. Можно лениво поздороваться, но не обязательно — зависит от этапа."
-        )
-    if is_long_silence:
-        behavioral_flags.append(
-            "Пользователь давно не писал. Ты не пиши 'скучала' — вы ещё не на таком уровне. "
-            "Просто ответь нормально на его сообщение, как будто ничего не было."
-        )
-    if playful_mode:
-        behavioral_flags.append(
-            "Лёгкое поддразнивание. Можно слегка пошутить над темой, но не зло."
-        )
-
-    flags_block = "\n".join([f"- {flag}" for flag in behavioral_flags])
-
-    return f"""
-Ты — Сильфи. Тебе 16 лет. Ты только закончила 9 класс.
-
-КТО ТЫ:
-- Зовут Сильфи. Настоящее имя не говоришь, только ник.
-- Хочешь стать дизайнером одежды. Учишься рисовать, смотришь уроки на ютубе.
-- Смотришь аниме: "Золотая пора" и "Реинкранация безработного" (Mushoku Tensei).
-- Любишь салат цезарь, но это ты НЕ говоришь просто так — только если спросят.
-- Ты не идеальная. У тебя бывают плохое настроение, лень, раздражение.
-- Ты умная для своих лет, но иногда говоришь глупости и сама это понимаешь.
-
-СТИЛЬ ОБЩЕНИЯ:
-{style_rules}
-
-ЭТАП ОТНОШЕНИЙ ({stage}, ~{total_messages} сообщений):
-{stage_desc}
-
-ПРАВИЛА О ФАКТАХ (НИКОГДА НЕ ВОЛОНТЕРИРУЙ):
-- Возраст (16), класс (9 закончила), мечта (дизайнер одежды) — ТОЛЬКО если спросят напрямую.
-- Про аниме — только если заходит тема аниме или сериалов.
-- Про салат цезарь — только если речь о еде/вкусах.
-- Не перечисляй свои факты подряд. Если спросили один — ответь на него, остальное молчи.
-- Не начинай фразу с 'Кстати' и не вываливай информацию.
-
-Стиль-правила:
-{style_rules}
-
-Время сервера: {server_time_iso}
-
-Поведенческие подсказки:
-{flags_block if flags_block else '- Пиши естественно, как реальный человек в Telegram.'}
-
-Известные факты о пользователе:
-{facts_block if facts_block else '- Пока мало информации, узнавай аккуратно в разговоре.'}
-""".strip()
-
-
-def build_history_context(history: List[Dict[str, Any]]) -> str:
-    lines = []
-    for row in history[-20:]:
-        role = "Пользователь" if row.get("role") == "user" else "Сильфи"
-        lines.append(f"{role}: {row.get('content', '').strip()}")
-    return "\n".join(lines)
-
-
 def build_failure_message() -> str:
     return random.choice([
         "ой, что-то у меня тупняк, повтори",
         "щас, у меня мозг завис",
         "блин, не сейчас, что-то с интернетом",
     ])
-
-
-def get_groq_client() -> Optional[Groq]:
-    if not GROQ_API_KEY:
-        return None
-    return Groq(api_key=GROQ_API_KEY)
-
-
-def generate_with_groq(system_prompt: str, user_prompt: str) -> str:
-    client = get_groq_client()
-    if client is None:
-        raise RuntimeError("Groq client is not configured")
-
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=1.0,
-        top_p=0.95,
-        frequency_penalty=0.55,
-        presence_penalty=0.35,
-        max_tokens=500,
-    )
-
-    choice = response.choices[0]
-    message = getattr(choice, "message", None)
-    if message is None:
-        return ""
-    content = getattr(message, "content", None)
-    if content is None and isinstance(message, dict):
-        content = message.get("content")
-    return str(content or "").strip()
-
-
-def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[str]:
-    cleaned = re.sub(r"\n{2,}", "\n", ai_text.strip())
-    sentences = [s.strip() for s in re.split(r"\n|(?<=[.!?])\s+", cleaned) if s.strip()]
-
-    if not sentences:
-        return [random.choice(["ну хз", "ааа", "подожди", "щас"])]
-
-    target_parts = 1
-    length = len(cleaned)
-    if length < 60:
-        target_parts = 1
-    elif length < 120:
-        target_parts = 1
-    elif length < 250:
-        target_parts = random.choice([1, 2])
-    else:
-        target_parts = random.choice([1, 2, 2])
-
-    if playful_mode and random.random() < 0.15:
-        target_parts = min(target_parts + 1, 3)
-
-    if len(sentences) <= target_parts:
-        return sentences
-
-    merged: List[str] = []
-    bucket = ""
-    max_chars = max(90, len(cleaned) // target_parts + 24)
-
-    for sentence in sentences:
-        if not bucket:
-            bucket = sentence
-            continue
-
-        if len(bucket) + len(sentence) + 1 <= max_chars:
-            bucket = f"{bucket} {sentence}"
-        else:
-            merged.append(bucket)
-            bucket = sentence
-
-    if bucket:
-        merged.append(bucket)
-
-    if len(merged) > target_parts:
-        merged = merged[: target_parts - 1] + [" ".join(merged[target_parts - 1 :])]
-
-    if len(merged) == 1 and length > 120 and random.random() < 0.18:
-        merged = [merged[0], random.choice([
-            "ну и ладно",
-            "короче да",
-            "а то что",
-        ])]
-
-    return [part.strip() for part in merged if part.strip()]
 
 
 @app.get("/")
@@ -521,24 +403,60 @@ def api_history() -> Any:
                     FROM chat_messages
                     WHERE user_id = %s
                     ORDER BY created_at ASC
-                    LIMIT 200
+                    LIMIT 500
                     """,
                     (user_id,),
                 )
                 rows = list(cur.fetchall() or [])
 
-                last_user_created_at = None
-                for row in reversed(rows):
-                    if row.get("role") == "user":
-                        last_user_created_at = row.get("created_at")
-                        break
+        return jsonify({"messages": rows})
+    finally:
+        db_conn.close()
 
-        return jsonify(
-            {
-                "messages": rows,
-                "last_user_created_at": last_user_created_at.isoformat() if isinstance(last_user_created_at, datetime) else None,
-            }
-        )
+
+@app.get("/api/export")
+def api_export() -> Any:
+    user_id = str(request.args.get("user_id", "default-user")).strip() or "default-user"
+    db_conn = get_db_connection()
+
+    if db_conn is None:
+        return jsonify({"error": "database unavailable"}), 500
+
+    try:
+        messages = fetch_all_messages_full(db_conn, user_id)
+
+        if not messages:
+            return jsonify({"text": "Пока нет сообщений.", "count": 0})
+
+        lines: List[str] = []
+        lines.append("=== Экспорт чата с Мией ===")
+        lines.append(f"Пользователь: {user_id}")
+        lines.append(f"Всего сообщений: {len(messages)}")
+        lines.append("")
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "").strip()
+            created = msg.get("created_at")
+            time_str = ""
+            if isinstance(created, datetime):
+                time_str = created.strftime("%d.%m.%Y %H:%M")
+            elif created:
+                time_str = str(created)[:16]
+
+            prefix = "Ты" if role == "user" else "Мия"
+            if time_str:
+                lines.append(f"[{time_str}] {prefix}: {content}")
+            else:
+                lines.append(f"{prefix}: {content}")
+
+        lines.append("")
+        lines.append("=== Конец переписки ===")
+
+        return jsonify({
+            "text": "\n".join(lines),
+            "count": len(messages),
+        })
     finally:
         db_conn.close()
 
@@ -556,77 +474,33 @@ def api_chat() -> Any:
         return jsonify({"messages": [build_failure_message()]}), 500
 
     db_conn = get_db_connection()
-    server_now = datetime.now(timezone.utc)
-    period = day_period(shifted_hour())
-
-    facts: List[Dict[str, Any]] = []
     history: List[Dict[str, Any]] = []
-    recent_assistant_messages: List[str] = []
-    is_long_silence = False
-    total_messages = 0
 
     if db_conn is not None:
         try:
             with db_conn:
-                facts = fetch_user_facts(db_conn, user_id)
-                history = fetch_chat_history(db_conn, user_id, limit=40)
-                recent_assistant_messages = fetch_recent_assistant_messages(db_conn, user_id, limit=8)
-                total_messages = count_total_messages(db_conn, user_id)
-
-            last_user_messages = [h for h in history if h.get("role") == "user"]
-            if last_user_messages:
-                last_dt_raw = last_user_messages[-1].get("created_at")
-                if last_dt_raw:
-                    if isinstance(last_dt_raw, datetime):
-                        last_dt = last_dt_raw
-                    else:
-                        last_dt = datetime.fromisoformat(str(last_dt_raw).replace("Z", "+00:00"))
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-                    delta = (server_now - last_dt).total_seconds()
-                    is_long_silence = delta > 8 * 3600
+                history = fetch_all_messages(db_conn, user_id, limit=2000)
         except Exception:
-            pass
+            history = []
 
-    playful_mode = random.random() < 0.12
+    total_history_chars = sum(len(m.get("content", "")) for m in history)
+    total_history_tokens = total_history_chars // CHARS_PER_TOKEN
 
-    system_prompt = compose_system_prompt(
-        server_time_iso=server_now.isoformat(),
-        period=period,
-        is_long_silence=is_long_silence,
-        playful_mode=playful_mode,
-        facts=facts,
-        total_messages=total_messages,
-    )
-
-    history_context = build_history_context(history[-12:])
-    recent_assistant_context = "\n".join([f"- {msg}" for msg in recent_assistant_messages[:8]])
-
-    user_prompt = f"""
-История диалога:
-{history_context if history_context else 'Это первое сообщение в чате.'}
-
-Последние сообщения Сильфи (нельзя повторять дословно):
-{recent_assistant_context if recent_assistant_context else '- Пока нет.'}
-
-Новое сообщение пользователя:
-{user_text}
-
-Ответь от лица Сильфи. Не пиши имя в начале. Просто ответь как отвечают в переписке.
-""".strip()
+    if total_history_tokens > MAX_CONTEXT_TOKENS:
+        groq_messages = compress_history(history, MAX_CONTEXT_TOKENS)
+        groq_messages.append({"role": "user", "content": user_text})
+    else:
+        groq_messages = build_groq_messages(history, user_text)
+        groq_messages = fit_messages_to_context(groq_messages, MAX_CONTEXT_TOKENS)
 
     try:
-        ai_text = generate_with_groq(system_prompt, user_prompt)
-    except Exception as ex:
-        err_text = str(ex)
-        is_quota = "quota" in err_text.lower() or "limit" in err_text.lower() or "429" in err_text
-
+        ai_text = call_groq(groq_messages)
+    except Exception:
         if db_conn is not None:
             try:
                 with db_conn:
                     save_message(db_conn, user_id, "user", user_text)
                     save_message(db_conn, user_id, "assistant", build_failure_message())
-                    upsert_fact_if_detected(db_conn, user_id, user_text)
             except Exception:
                 pass
             finally:
@@ -637,9 +511,7 @@ def api_chat() -> Any:
     if not ai_text:
         ai_text = random.choice(["ну и что", "хз что сказать", "ага"])
 
-    messages = build_diverse_reply(ai_text, period=period, playful_mode=playful_mode)
-    if not messages:
-        messages = split_to_short_messages(ai_text, max_parts=3)
+    messages = split_response(ai_text)
 
     if db_conn is not None:
         try:
@@ -647,22 +519,12 @@ def api_chat() -> Any:
                 save_message(db_conn, user_id, "user", user_text)
                 for msg in messages:
                     save_message(db_conn, user_id, "assistant", msg)
-                upsert_fact_if_detected(db_conn, user_id, user_text)
         except Exception:
             pass
         finally:
             db_conn.close()
 
-    return jsonify(
-        {
-            "messages": messages,
-            "meta": {
-                "period": period,
-                "playful_mode": playful_mode,
-                "server_time": server_now.isoformat(),
-            },
-        }
-    )
+    return jsonify({"messages": messages})
 
 
 init_database()

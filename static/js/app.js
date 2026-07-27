@@ -3,6 +3,7 @@ const formEl = document.getElementById("chatForm");
 const inputEl = document.getElementById("messageInput");
 const typingEl = document.getElementById("typingIndicator");
 const statusLineEl = document.getElementById("statusLine");
+const exportBtn = document.getElementById("exportBtn");
 
 const USER_ID_KEY = "cozy_ai_user_id";
 const LAST_USER_ACTIVITY_KEY = "cozy_last_user_activity_at";
@@ -208,6 +209,50 @@ async function loadHistory() {
   updateStatusLine();
 }
 
+async function exportChat() {
+  const userId = getOrCreateUserId();
+
+  exportBtn.disabled = true;
+  exportBtn.textContent = "⏳";
+
+  try {
+    const response = await fetch(`/api/export?user_id=${encodeURIComponent(userId)}`);
+    if (!response.ok) {
+      alert("Не удалось экспортировать чат");
+      return;
+    }
+
+    const data = await response.json();
+    const text = data.text || "Пусто";
+    const count = data.count || 0;
+
+    if (count === 0) {
+      alert("Пока нет сообщений для экспорта");
+      return;
+    }
+
+    if (navigator.share) {
+      await navigator.share({ title: "Переписка с Мией", text: text });
+    } else if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      alert("Чат скопирован в буфер обмена! (" + count + " сообщений)");
+    } else {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "chat_with_mia.txt";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  } catch (err) {
+    alert("Ошибка при экспорте: " + err.message);
+  } finally {
+    exportBtn.disabled = false;
+    exportBtn.textContent = "↗";
+  }
+}
+
 formEl.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = inputEl.value.trim();
@@ -225,6 +270,8 @@ formEl.addEventListener("submit", async (event) => {
     await showAiMessagesWithTyping(["Извини, у меня сбой ("]);
   }
 });
+
+exportBtn.addEventListener("click", exportChat);
 
 function iosKeyboardFix() {
   const vv = window.visualViewport;

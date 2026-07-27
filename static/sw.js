@@ -1,4 +1,4 @@
-const CACHE_NAME = "cozy-gf-cache-v1";
+const CACHE_NAME = "cozy-gf-cache-v2";
 const URLS = ["/", "/static/css/style.css", "/static/js/app.js", "/static/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {

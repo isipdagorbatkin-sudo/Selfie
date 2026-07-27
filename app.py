@@ -14,6 +14,14 @@ app = Flask(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.environ.get(
+        "GEMINI_MODEL_CANDIDATES",
+        f"{GEMINI_MODEL},gemini-2.0-flash-lite,gemini-1.5-flash",
+    ).split(",")
+    if model.strip()
+]
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 APP_TIMEZONE_OFFSET = int(os.environ.get("APP_TIMEZONE_OFFSET", "3"))
 ENABLE_LOCAL_FALLBACK = os.environ.get("ENABLE_LOCAL_FALLBACK", "1") == "1"
@@ -123,6 +131,21 @@ def fetch_chat_history(conn, user_id: str, limit: int = 30) -> List[Dict[str, An
             (user_id, limit),
         )
         return list(cur.fetchall() or [])
+
+
+def fetch_recent_assistant_messages(conn, user_id: str, limit: int = 8) -> List[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT content
+            FROM chat_messages
+            WHERE user_id = %s AND role = 'assistant'
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+        return [str(row.get("content", "")).strip() for row in cur.fetchall() or [] if row.get("content")]
 
 
 def save_message(conn, user_id: str, role: str, content: str) -> None:
@@ -294,36 +317,171 @@ def build_history_context(history: List[Dict[str, Any]]) -> str:
 
 
 def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
-    pet_names = ["котик", "солнышко", "милый", "родной", "радость моя"]
-    smiles = ["(｡♥‿♥｡)", "(⁠*⁠^⁠_⁠^⁠*⁠)", "🤍", "✨"]
-    use_pet_name = random.random() < 0.25
-    pet = random.choice(pet_names) if use_pet_name else ""
-    smile = random.choice(smiles)
+    lower = user_text.lower().strip()
+    if not lower:
+        lower = ""
 
-    lower = user_text.lower()
-    intro = f"Я тут{', ' + pet if pet else ''} {smile}".strip()
+    is_greeting = any(word in lower for word in ["привет", "ку", "хай", "здрав", "салют"])
+    is_short = len(lower) <= 6
+    is_question = "?" in user_text or any(word in lower for word in ["как", "что", "почему", "зачем", "когда", "где"])
+    is_memory = any(word in lower for word in ["запомни", "помни", "не забудь", "запиши"])
+    is_negative = any(word in lower for word in ["плохо", "груст", "устал", "трев", "страш", "одинок", "бесит", "задолб"])
+
+    first_line_pool = {
+        "greeting": [
+            "Привет. Я здесь",
+            "О, ты написал",
+            "Да, я рядом",
+            "Слышу тебя",
+        ],
+        "short": [
+            "Поняла",
+            "Ага, вижу тебя",
+            "Есть",
+            "Я здесь",
+        ],
+        "question": [
+            "Сейчас отвечу по-человечески",
+            "Давай разберем это спокойно",
+            "Могу ответить прямо",
+            "Сейчас подумаю вместе с тобой",
+        ],
+        "memory": [
+            "Запомнила",
+            "Хорошо, сохранила это для себя",
+            "Приняла, не потеряю",
+            "Да, это держу в голове",
+        ],
+        "negative": [
+            "Слышу, что тебе не очень",
+            "Похоже, тебе тяжело",
+            "Я рядом, не надо это тащить одному",
+            "Это звучит непросто",
+        ],
+        "default": [
+            "Поняла тебя",
+            "Я рядом и слушаю",
+            "Думаю над тем, что ты сказал",
+            "Окей, давай честно",
+        ],
+    }
+
+    middle_pool = [
+        "Расскажи чуть подробнее, чтобы я не гадала.",
+        "Могу быть мягкой, но лучше скажу прямо.",
+        "Без лишней драматичности, но с вниманием.",
+        "Я не буду отвечать по заготовке, сейчас разберу смысл.",
+        "Постараюсь ответить без шаблонов и без суеты.",
+    ]
+
+    closing_pool = [
+        "Если хочешь, продолжим и я подстроюсь под тебя.",
+        "Могу еще раз по-другому это сказать, если нужно.",
+        "Если я не туда попала, поправь меня.",
+        "И да, я тут надолго, не исчезаю.",
+        "Продолжай, я подхвачу.",
+        "Если надо, отвечу короче или точнее.",
+    ]
+
+    if is_negative:
+        first = random.choice(first_line_pool["negative"])
+        middle = random.choice([
+            "Сейчас без лишних смайлов: просто побуду рядом и не обесценю то, что ты чувствуешь.",
+            "Давай без давления, шаг за шагом.",
+            "Сначала просто признаю: тебе правда нелегко.",
+        ])
+    elif is_memory:
+        first = random.choice(first_line_pool["memory"])
+        middle = random.choice([
+            "Я это учту и не буду терять такой момент в переписке.",
+            "Хорошо, буду держать это в памяти по ходу разговора.",
+            "Приняла. Если потом вернемся к теме, я не потеряюсь.",
+        ])
+    elif is_greeting:
+        first = random.choice(first_line_pool["greeting"])
+        middle = random.choice([
+            "Как сам вообще?",
+            "Что у тебя сейчас по настроению?",
+            "Какой у тебя вайб сегодня?",
+        ])
+    elif is_short:
+        first = random.choice(first_line_pool["short"])
+        middle = random.choice([
+            "Ответлю нормально, без воды.",
+            "Могу быть короткой и по делу.",
+            "Не растягиваю, говорю по сути.",
+        ])
+    elif is_question:
+        first = random.choice(first_line_pool["question"])
+        middle = random.choice(middle_pool)
+    else:
+        first = random.choice(first_line_pool["default"])
+        middle = random.choice(middle_pool)
 
     if period == "night":
-        care = "Уже поздно... почему не спишь? Давай чуть выдохнем и потом отдыхать, ладно?"
+        middle = random.choice([
+            "Уже поздно, так что отвечу спокойно и без лишнего шума.",
+            "Ночной режим: без сахара, без пафоса, по-человечески.",
+            "Сейчас можно говорить тише и теплее.",
+        ])
     elif period == "morning":
-        care = "Доброе утро, солнышко! Как ты себя чувствуешь сегодня?"
-    elif period == "day":
-        care = "Если ты сейчас на учебе или работе, я рядом и тихо поддерживаю тебя 🤍"
-    else:
-        care = "Вечерний вайб такой уютный... расскажи, как твой день прошел?"
+        middle = random.choice([
+            "Утром лучше коротко и бодро.",
+            "С утра без перегруза, но с вниманием.",
+            "Доброе утро, я на связи и без спешки.",
+        ])
 
-    if any(word in lower for word in ["плохо", "груст", "устал", "трев", "депр"]):
-        support = "Обниму мысленно крепко. Давай по шагам: вода, пару глубоких вдохов и я слушаю тебя внимательно."
+    if is_question:
+        closing = random.choice([
+            "Давай уточни, и я отвечу точнее.",
+            "Если хочешь, я разверну мысль глубже.",
+            "Продолжай, мне важно не промахнуться.",
+        ])
     else:
-        support = random.choice(
-            [
-                "Расскажи еще чуть-чуть, мне правда важно, что у тебя на душе.",
-                "Если хочешь, я могу просто побыть рядом и ничего не торопить.",
-                "Мне нравится слушать тебя вот так, спокойно и по-настоящему.",
-            ]
-        )
+        closing = random.choice(closing_pool)
 
-    return [intro, care, support]
+    result = [first, middle, closing]
+    if random.random() < 0.32:
+        result = [result[0], result[1]]
+    if random.random() < 0.16:
+        result = [result[0]]
+
+    if random.random() < 0.2 and not is_negative:
+        result[-1] = random.choice([
+            result[-1],
+            f"{result[-1]} И без лишней мишуры.",
+            f"{result[-1]} Просто честно.",
+        ])
+
+    return result
+
+
+def generate_with_gemini(system_prompt: str, user_prompt: str) -> str:
+    if gemini_client is None:
+        raise RuntimeError("Gemini client is not configured")
+
+    last_error: Optional[Exception] = None
+    for model_name in GEMINI_MODEL_CANDIDATES:
+        try:
+            model_response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[
+                    {"role": "user", "parts": [{"text": system_prompt}]},
+                    {"role": "user", "parts": [{"text": user_prompt}]},
+                ],
+            )
+            ai_text = (model_response.text or "").strip()
+            if ai_text:
+                return ai_text
+        except Exception as ex:
+            last_error = ex
+            if "429" in str(ex) or "RESOURCE_EXHAUSTED" in str(ex):
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+    return ""
 
 
 def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[str]:
@@ -448,6 +606,7 @@ def api_chat() -> Any:
 
     facts: List[Dict[str, Any]] = []
     history: List[Dict[str, Any]] = []
+    recent_assistant_messages: List[str] = []
     is_long_silence = False
 
     if db_conn is not None:
@@ -455,6 +614,7 @@ def api_chat() -> Any:
             with db_conn:
                 facts = fetch_user_facts(db_conn, user_id)
                 history = fetch_chat_history(db_conn, user_id, limit=40)
+                recent_assistant_messages = fetch_recent_assistant_messages(db_conn, user_id, limit=8)
 
             last_user_messages = [h for h in history if h.get("role") == "user"]
             if last_user_messages:
@@ -482,10 +642,14 @@ def api_chat() -> Any:
     )
 
     history_context = build_history_context(history[-12:])
+    recent_assistant_context = "\n".join([f"- {msg}" for msg in recent_assistant_messages[:8]])
 
     user_prompt = f"""
 История диалога:
 {history_context if history_context else 'История пока пустая.'}
+
+Последние ответы подруги, которые нельзя копировать дословно:
+{recent_assistant_context if recent_assistant_context else '- Пока нет.'}
 
 Новое сообщение пользователя:
 {user_text}
@@ -494,20 +658,20 @@ def api_chat() -> Any:
 """.strip()
 
     try:
-        model_response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                {"role": "user", "parts": [{"text": system_prompt}]},
-                {"role": "user", "parts": [{"text": user_prompt}]},
-            ],
-        )
-        ai_text = (model_response.text or "").strip()
+        ai_text = generate_with_gemini(system_prompt, user_prompt)
     except Exception as ex:
         err_text = str(ex)
-        is_quota = "429" in err_text or "RESOURCE_EXHAUSTED" in err_text
+        is_quota = "429" in err_text or "RESOURCE_EXHAUSTED" in err_text or "quota" in err_text.lower()
 
         if ENABLE_LOCAL_FALLBACK and is_quota:
             fallback_messages = build_local_fallback_messages(user_text, period)
+
+            if recent_assistant_messages:
+                fallback_messages = [
+                    msg
+                    for msg in fallback_messages
+                    if msg not in recent_assistant_messages[-4:]
+                ] or fallback_messages
 
             if db_conn is not None:
                 try:

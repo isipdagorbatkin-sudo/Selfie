@@ -11,7 +11,7 @@ from duckduckgo_search import DDGS
 from psycopg import connect
 from psycopg.rows import dict_row
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 
 app = Flask(__name__)
 
@@ -23,18 +23,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 MAX_CONTEXT_TOKENS = 120000
 CHARS_PER_TOKEN = 4
 
-IMAGE_TAG_PATTERN = re.compile(r"\[IMAGE:\s*(\w+)\]", re.IGNORECASE)
-
-GALLERY_IMAGES = {
-    "room": "/static/gallery/room.jpg",
-    "drawing": "/static/gallery/drawing.jpg",
-    "tea": "/static/gallery/tea.jpg",
-    "music": "/static/gallery/music.jpg",
-    "selfie": "/static/gallery/selfie.jpg",
-    "cat": "/static/gallery/cat.jpg",
-    "food": "/static/gallery/food.jpg",
-    "sunset": "/static/gallery/sunset.jpg",
-}
+IMAGE_TAG_PATTERN = re.compile(r"\[IMAGE:\s*(.+?)\]", re.IGNORECASE)
 
 SEARCH_TOOLS = [
     {
@@ -91,15 +80,20 @@ SYSTEM_PROMPT = """ты — Сильфи. тебе 16 лет, ты хикка, �
 
 фото и картинки:
 - если пользователь прислал тебе фото — посмотри на него и отреагируй как реальный человек. опиши что видишь, прокомментируй в своем стиле.
-- ты можешь "отправлять" фотографии. чтобы показать свою жизнь, вставь в конец сообщения тег: [IMAGE: тип]
-доступные типы: room, drawing, tea, music, selfie, cat, food, sunset
-используй тоголько когда логично: показываешь комнату, рисунок, чай, музыку, себя, кота, еду, закат.
-не вставляй тег просто так — только когда сама предлагаешь посмотреть или отвечаешь на вопрос "а покажи..."
-примеры:
-"вот моя комната, извини за беспорядок [IMAGE: room]"
-"я тут нарисовала кое-что, смотри [IMAGE: drawing]"
-"кстати вот мой чай, обожаю его [IMAGE: tea]"
-- не вставляй больше одного тега за сообщение.
+- ты можешь "отправлять" фотографии. чтобы найти и показать картинку, вставь в конец сообщения тег: [IMAGE: описание на английском]
+- описание должно быть КОНКРЕТНЫМ поисковым запросом на английском для лучшего результата. пиши ключевые слова через пробел.
+- используй тег когда: сама предлагаешь посмотреть, или отвечаешь на вопрос "а покажи...", или хочешь показать что-то визуальное.
+- не вставляй тег просто так — только когда он логичен.
+- НЕ вставляй больше одного тега за сообщение.
+- примеры тегов:
+  * показываешь комнату: [IMAGE: anime cozy dark room hikikomori setup]
+  * показываешь рисунок: [IMAGE: cute anime girl drawing sketch pencil art]
+  * показываешь чай: [IMAGE: cozy anime tea cup warm light aesthetic]
+  * показываешь музыку: [IMAGE: anime girl headphones lofi music dark room]
+  * показываешь себя: [IMAGE: shy anime girl selfie cute casual]
+  * показываешь кота: [IMAGE: cute fluffy cat anime style]
+  * показываешь еду: [IMAGE: delicious pizza anime food aesthetic]
+  * показываешь закат: [IMAGE: beautiful sunset sky anime aesthetic]
 
 характер:
 - ты милая и ламповая, но не навязчивая.
@@ -266,16 +260,34 @@ def get_stage(msg_count: int) -> str:
     return f"этап 3 (сейчас ~{msg_count} сообщений, ты полностью раскрепостилась, болтливая аниме-тянка)"
 
 
+def fetch_live_image(search_query: str) -> Optional[str]:
+    """Ищет картинку в DuckDuckGo Images, возвращает URL случайной из топ-5."""
+    log(f"fetch_live_image: searching for '{search_query}'")
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(search_query, max_results=5))
+        if not results:
+            log("fetch_live_image: no results found")
+            return None
+        chosen = random.choice(results)
+        url = chosen.get("image") or chosen.get("thumbnail") or chosen.get("url", "")
+        log(f"fetch_live_image: picked url={url[:80]}")
+        return url if url else None
+    except Exception as e:
+        log(f"fetch_live_image error: {e}")
+        return None
+
+
 def parse_image_tag(text: str) -> Tuple[str, Optional[str]]:
     match = IMAGE_TAG_PATTERN.search(text)
     if not match:
         return text.strip(), None
 
-    tag_type = match.group(1).lower()
-    image_url = GALLERY_IMAGES.get(tag_type)
+    search_query = match.group(1).strip()
+    image_url = fetch_live_image(search_query)
 
     clean_text = IMAGE_TAG_PATTERN.sub("", text).strip()
-    log(f"parse_image_tag: found [{tag_type}], url={image_url}")
+    log(f"parse_image_tag: query='{search_query}', url={image_url}")
 
     return clean_text, image_url
 

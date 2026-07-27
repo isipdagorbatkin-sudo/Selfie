@@ -1,4 +1,5 @@
 Flask==3.0.3
 groq
+duckduckgo_search
 psycopg[binary]==3.2.13
 gunicorn==23.0.0

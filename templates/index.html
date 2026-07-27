@@ -45,6 +45,13 @@
 
       <form id="chatForm" class="composer" autocomplete="off">
         <input
+          id="fileInput"
+          type="file"
+          accept="image/*"
+          class="hidden-file-input"
+        />
+        <button id="attachBtn" type="button" class="attach-btn" title="Прикрепить фото">📎</button>
+        <input
           id="messageInput"
           type="text"
           placeholder="Сообщение"

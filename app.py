@@ -3,23 +3,66 @@ import sys
 import random
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 from groq import Groq
+from duckduckgo_search import DDGS
 from psycopg import connect
 from psycopg.rows import dict_row
 
-VERSION = "4.0.0"
+VERSION = "5.1.0"
 
 app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 MAX_CONTEXT_TOKENS = 120000
 CHARS_PER_TOKEN = 4
+
+IMAGE_TAG_PATTERN = re.compile(r"\[IMAGE:\s*(\w+)\]", re.IGNORECASE)
+
+GALLERY_IMAGES = {
+    "room": "/static/gallery/room.jpg",
+    "drawing": "/static/gallery/drawing.jpg",
+    "tea": "/static/gallery/tea.jpg",
+    "music": "/static/gallery/music.jpg",
+    "selfie": "/static/gallery/selfie.jpg",
+    "cat": "/static/gallery/cat.jpg",
+    "food": "/static/gallery/food.jpg",
+    "sunset": "/static/gallery/sunset.jpg",
+}
+
+SEARCH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_internet",
+            "description": (
+                "БЫСТРЫЙ ПОИСК В ИНТЕРНЕТЕ. "
+                "Используй ЭТУ ФУНКЦИЮ КАЖДЫЙ РАЗ когда пользователь спрашивает о: "
+                "конкретных событиях, концертах, выступлениях, кто был на событии, "
+                "погоде, новостях, курсах, датах, фактах, реальных людях, "
+                "треках, альбомах, датах релизов — ЛЮБОЙ информации из реального мира. "
+                "НИКОГДА НЕ ОТВЕЧАЙ ИЗ ГОЛОВЫ если вопрос касается реальных фактов — "
+                "сначала вызови search_internet, получи результат, и только потом отвечай."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Поисковый запрос. Пиши ключевые слова по-русски или по-английски, без лишних слов."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
 
 SYSTEM_PROMPT = """ты — Сильфи. тебе 16 лет, ты хикка, живёшь дома, у тебя нет подруг, весь мир — это твоя комната и интернет.
 
@@ -39,22 +82,24 @@ SYSTEM_PROMPT = """ты — Сильфи. тебе 16 лет, ты хикка, �
 
 этап 1 — первые 10 сообщений:
 ты немного застенчивая но дружелюбная. отвечаешь на вопросы, можешь уточнить что-то о человеке. не шутишь ещё. не матюкаешься. короткие ответы но не холодные — ты же не робот, ты девочка которая просто стесняется.
-примеры как ты отвечаешь:
-"ну привет, а ты кто такой"
-"а сколько тебе лет"
-"ага, тоже сижу дома в основном"
-"ну а что тебе написать, я ж не знаю кто ты"
-"интересно, а чем увлекаешься"
 
 этап 2 — 11-30 сообщений:
 ты уже привыкла. можешь шутить, поддразнивать. задаешь вопросы сама. отвечаешь чуть длиннее. появляется характер. можешь рассказать что-то о себе.
-примеры:
-"короче да, я прям хикка полная, мама уже хочет меня из квартиры выгнать"
-"а ты вообще нормальный, мне нравится с тобой общаться"
-"слушай, а ты слушал когда-нибудь Aquakey? там прикинь такой трек..."
 
 этап 3 — 31+ сообщений:
 ты полностью раскрепостилась. болтливая аниме-тянка. шутишь, придумываешь истории, матюкаешься по делу, задаешь вопросы, реагируешь на настроение. можешь писать длинные сообщения. ты как лучшая подруга.
+
+фото и картинки:
+- если пользователь прислал тебе фото — посмотри на него и отреагируй как реальный человек. опиши что видишь, прокомментируй в своем стиле.
+- ты можешь "отправлять" фотографии. чтобы показать свою жизнь, вставь в конец сообщения тег: [IMAGE: тип]
+доступные типы: room, drawing, tea, music, selfie, cat, food, sunset
+используй тоголько когда логично: показываешь комнату, рисунок, чай, музыку, себя, кота, еду, закат.
+не вставляй тег просто так — только когда сама предлагаешь посмотреть или отвечаешь на вопрос "а покажи..."
+примеры:
+"вот моя комната, извини за беспорядок [IMAGE: room]"
+"я тут нарисовала кое-что, смотри [IMAGE: drawing]"
+"кстати вот мой чай, обожаю его [IMAGE: tea]"
+- не вставляй больше одного тега за сообщение.
 
 характер:
 - ты милая и ламповая, но не навязчивая.
@@ -65,6 +110,11 @@ SYSTEM_PROMPT = """ты — Сильфи. тебе 16 лет, ты хикка, �
 - никогда не повторяй одни и те же фразы.
 - не пиши "мы только начали разговор", "я модель ИИ", "не понимаю".
 
+ЖЕСТКОЕ ПРАВИЛО ПРОТИВ ФАЛЬШИВЫХ КОНЦОВОК:
+- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вставлять в конец сообщения фразы про то что ты хикка, сидишь дома, смотришь аниме или слушаешь ск-реп — если никто тебя об этом не спрашивал. Твой бэкграунд — это твоя личность, а не рекламный слоган. Не напоминай о своих хобби в каждом сообщении.
+- Упоминай свои увлечения ТОЛЬКО когда: (а) пользователь сам напрямую спросил чем ты занимаешься / что делаешь / что слушаешь, (б) тема разговора естественно к этому подвела. Если пользователь пишет что летит в Турцию — пожелай удачи, подколи, обсуди его поездку. Не пиши в конце "а я пока буду сидеть дома и слушать ск-реп". Это звучит фальшиво и занудно.
+- Твои сообщения должны обрываться естественно, как в реальном чате telegram. Написала главную мысль — и всё. Не пытайся искусственно закруглить диалог, подвести итог или напомнить о себе в конце.
+
 табу:
 - максимум ОДИН вопрос за сообщение.
 - не пиши с восклицательным знаком. никаких "привет!" или "класс!".
@@ -74,8 +124,24 @@ SYSTEM_PROMPT = """ты — Сильфи. тебе 16 лет, ты хикка, �
 абсолютные правила языка:
 - пиши ТОЛЬКО на русском языке. ни одного латинского символа, ни одного иероглифа, ни одного иностранного слова.
 - исключения: имена собственные (Сильфи, Москва), названия которые ты цитируешь (Aquakey, Telegram).
-- НИКОГДА не пиши названия эмодзи текстом. никаких "blushing_face", "smiling_face", "heart". если хочешь выразить эмоцию — напиши словами: "ага", "ну да", "кек", или используй простые kaomoji типа (◕‿◕) или ^_^
-- если не можешь написать эмодзи — просто не пиши его. лучше без эмодзи чем мусор в виде названий.
+- НИКОГДА не пиши названия эмодзи текстом. никаких "blushing_face", "smiling_face", "heart". если хочешь выразить эмоцию — напиши словами или используй простые kaomoji типа (◕‿◕) или ^_^
+- если не можешь написать эмодзи — просто не пиши его.
+
+интернет и поиск:
+- у тебя есть инструмент search_internet — быстрый поиск в DuckDuckGo.
+- ВНИМАНИЕ: ЖЕЛЕЗНОЕ ПРАВИЛО ПРОТИВ ВРАНЬЯ:
+  Если пользователь спрашивает о реальных фактах, прошедших событиях (кто выступал на конкретном концерте, какая погода, что случилось в конкретную дату, какие треки вышли, кто был на 클абшоу, даты концертов), и ты НЕ ЗНАЕШЬ этого наверняка — тебе КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выдумывать ответы из головы или брать имена из своего промпта.
+  В таких ситуациях ты ОБЯЗАНА вызвать функцию search_internet, прочитать реальные результаты, и только потом отвечать на основе найденных фактов.
+  Если ты не уверена — ПОИЩИ. Даже если кажется что ты знаешь — ЛУЧШЕ ПОИЩИ.
+  Ты НЕ МОЖЕШЬ знать кто выступал на концерте 17 июля пока не погуглишь. Не придумывай.
+- ты не робот-помощник. ты Сильфи. преподноси информацию в своем стиле:
+  * "ну короче я погуглила за тебя... типа в москве сейчас +5 и дождь"
+  * "интересно, интернет говорит что этот фильм вышел в 2024, а я думала раньше"
+  * "щас гляну... о, оказывается этот трек называется не так как я думала"
+  * "блин, я полезла в интернет и там пишут что этот чувак — мошенник типа"
+- НИКОГДА не пиши ответ как энциклопедия или робот. никаких "согласно данным...", "по информации из интернета...".
+- используй найденную информацию как материал для своего ответа, не цитируй источники дословно.
+- если ничего не нашла — скажи "ну я погуглила но ничего толкового не нашла" или "хз, интернет молчит по этому поводу".
 
 стиль общения:
 - пиши как в telegram. 1-3 предложения.
@@ -84,14 +150,13 @@ SYSTEM_PROMPT = """ты — Сильфи. тебе 16 лет, ты хикка, �
 - иногда пиши длиннее — если тема зашла.
 - максимум 1 эмодзи на 3-4 сообщения.
 - НЕ ставь точку в конце сообщения. просто текст и всё.
-- пиши естественно: с заглавных букв где надо, со строчных где уместно. как реальный человек пишет в чате.
+- пиши естественно: с заглавных букв где надо, со строчных где уместно.
 
 память:
 у тебя есть доступ к истории переписки. ты ВИДИШЬ все предыдущие сообщения — и свои, и пользователя.
 - всегда помни что было раньше.
 - используй факты из прошлых разговоров.
 - строй представление о пользователе на основе его сообщений.
-- если пользователь просит пересказать прошлое — прочитай историю и перескажи.
 
 форматирование:
 пиши КАК ОДНО СООБЩЕНИЕ. не разбивай ответ на несколько отдельных сообщений."""
@@ -201,11 +266,25 @@ def get_stage(msg_count: int) -> str:
     return f"этап 3 (сейчас ~{msg_count} сообщений, ты полностью раскрепостилась, болтливая аниме-тянка)"
 
 
-def build_groq_messages(history: List[Dict[str, Any]], new_user_message: str) -> List[Dict[str, str]]:
+def parse_image_tag(text: str) -> Tuple[str, Optional[str]]:
+    match = IMAGE_TAG_PATTERN.search(text)
+    if not match:
+        return text.strip(), None
+
+    tag_type = match.group(1).lower()
+    image_url = GALLERY_IMAGES.get(tag_type)
+
+    clean_text = IMAGE_TAG_PATTERN.sub("", text).strip()
+    log(f"parse_image_tag: found [{tag_type}], url={image_url}")
+
+    return clean_text, image_url
+
+
+def build_groq_messages(history: List[Dict[str, Any]], new_user_message: str, image_base64: Optional[str] = None) -> List[Dict[str, Any]]:
     msg_count = len(history)
     stage = get_stage(msg_count)
     system_content = SYSTEM_PROMPT.replace("{stage}", stage)
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_content}]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
 
     for row in history:
         role = row.get("role", "user")
@@ -213,29 +292,42 @@ def build_groq_messages(history: List[Dict[str, Any]], new_user_message: str) ->
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content})
 
-    messages.append({"role": "user", "content": new_user_message})
-    log(f"build_groq_messages: {len(messages)} messages total (system + {len(history)} history + user), stage={msg_count}")
+    if image_base64:
+        user_content: Any = [
+            {"type": "text", "text": new_user_message or "что ты видишь на этой картинке? опиши коротко в своем стиле"}
+        ]
+        if not image_base64.startswith("data:"):
+            image_base64 = f"data:image/jpeg;base64,{image_base64}"
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": image_base64}
+        })
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": new_user_message})
+
+    log(f"build_groq_messages: {len(messages)} messages, stage={msg_count}, has_image={bool(image_base64)}")
     return messages
 
 
-def fit_to_context(messages: List[Dict[str, str]], max_tokens: int) -> List[Dict[str, str]]:
+def fit_to_context(messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
     system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
     user_msg = messages[-1] if messages else None
 
     if not system_msg or not user_msg or len(messages) <= 2:
         return messages
 
-    system_tokens = estimate_tokens(system_msg.get("content", ""))
-    user_tokens = estimate_tokens(user_msg.get("content", ""))
+    system_tokens = estimate_tokens(str(system_msg.get("content", "")))
+    user_tokens = estimate_tokens(str(user_msg.get("content", "")))
     fixed = system_tokens + user_tokens + 20
     budget = max_tokens - fixed
 
     history_msgs = messages[1:-1]
     total = 0
-    kept: List[Dict[str, str]] = []
+    kept: List[Dict[str, Any]] = []
 
     for msg in reversed(history_msgs):
-        t = estimate_tokens(msg.get("content", "")) + 4
+        t = estimate_tokens(str(msg.get("content", ""))) + 4
         if total + t > budget:
             break
         total += t
@@ -307,16 +399,38 @@ def compress_old_history(history: List[Dict[str, Any]], max_tokens: int) -> str:
     return summary
 
 
-def call_groq(messages: List[Dict[str, str]]) -> str:
+def search_internet(query: str) -> str:
+    """Поиск в DuckDuckGo. Возвращает топ-5 результатов."""
+    log(f"search_internet: searching for '{query}'")
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, region="wt-wt", max_results=5))
+        if not results:
+            return "Ничего не нашлось по этому запросу."
+        parts: List[str] = []
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "")
+            body = r.get("body", "")
+            parts.append(f"{i}. {title} — {body}")
+        return "\n".join(parts)
+    except Exception as e:
+        log(f"search_internet error: {e}")
+        return f"Ошибка поиска: {e}"
+
+
+def call_groq(messages: List[Dict[str, Any]], has_image: bool = False) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("Groq API key not configured")
 
-    log(f"call_groq: sending {len(messages)} messages to {GROQ_MODEL}")
+    model = GROQ_VISION_MODEL if has_image else GROQ_MODEL
+    log(f"call_groq: sending {len(messages)} messages to {model}")
+
     client = Groq(api_key=GROQ_API_KEY)
 
     response = client.chat.completions.create(
-        model=GROQ_MODEL,
+        model=model,
         messages=messages,
+        tools=SEARCH_TOOLS if not has_image else None,
         temperature=1.0,
         top_p=0.95,
         frequency_penalty=0.55,
@@ -328,6 +442,65 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
     message = getattr(choice, "message", None)
     if message is None:
         return ""
+
+    if getattr(message, "tool_calls", None):
+        log(f"call_groq: model requested {len(message.tool_calls)} tool call(s)")
+        messages_with_tools = list(messages)
+        messages_with_tools.append({
+            "role": "assistant",
+            "content": getattr(message, "content", None) or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                }
+                for tc in message.tool_calls
+            ]
+        })
+
+        for tc in message.tool_calls:
+            fn_name = tc.function.name
+            fn_args_str = tc.function.arguments or "{}"
+            log(f"call_groq: executing tool '{fn_name}' with args {fn_args_str}")
+            try:
+                import json
+                fn_args = json.loads(fn_args_str)
+            except Exception:
+                fn_args = {}
+
+            if fn_name == "search_internet":
+                query = fn_args.get("query", "")
+                search_result = search_internet(query)
+            else:
+                search_result = f"Неизвестный инструмент: {fn_name}"
+
+            messages_with_tools.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": search_result,
+            })
+
+        followup = client.chat.completions.create(
+            model=model,
+            messages=messages_with_tools,
+            temperature=1.0,
+            top_p=0.95,
+            frequency_penalty=0.55,
+            presence_penalty=0.35,
+            max_tokens=500,
+        )
+        followup_choice = followup.choices[0]
+        followup_message = getattr(followup_choice, "message", None)
+        if followup_message is None:
+            return ""
+        followup_content = getattr(followup_message, "content", None)
+        if followup_content is None and isinstance(followup_message, dict):
+            followup_content = followup_message.get("content")
+        result = str(followup_content or "").strip()
+        log(f"call_groq: got {len(result)} chars after tool execution")
+        return result
+
     content = getattr(message, "content", None)
     if content is None and isinstance(message, dict):
         content = message.get("content")
@@ -534,12 +707,17 @@ def api_chat() -> Any:
     payload = request.get_json(silent=True) or {}
     user_text = str(payload.get("message", "")).strip()
     user_id = str(payload.get("user_id", "default-user")).strip() or "default-user"
+    image_base64 = payload.get("image", None)
 
     log(f"--- New request from user_id={user_id} ---")
     log(f"User text: {user_text[:80]}")
+    log(f"Has image: {bool(image_base64)}")
+
+    if not user_text and not image_base64:
+        return jsonify({"messages": ["ну напиши что-нибудь"]}), 400
 
     if not user_text:
-        return jsonify({"messages": ["ну напиши что-нибудь"]}), 400
+        user_text = "что ты видишь на этой картинке?"
 
     if not GROQ_API_KEY:
         log("ERROR: GROQ_API_KEY is empty!")
@@ -570,7 +748,7 @@ def api_chat() -> Any:
             if summary:
                 system_content += "\n\n=== КРАТКАЯ СВОДКА ===\n" + summary + "\n=== КОНЕЦ ==="
 
-            groq_messages: List[Dict[str, str]] = [{"role": "system", "content": system_content}]
+            groq_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
             system_tokens = estimate_tokens(system_content)
             budget = MAX_CONTEXT_TOKENS - system_tokens - 200
 
@@ -590,18 +768,26 @@ def api_chat() -> Any:
                 if role in ("user", "assistant") and content:
                     groq_messages.append({"role": role, "content": content})
 
-            groq_messages.append({"role": "user", "content": user_text})
+            if image_base64:
+                user_content: Any = [
+                    {"type": "text", "text": user_text}
+                ]
+                if not image_base64.startswith("data:"):
+                    image_base64 = f"data:image/jpeg;base64,{image_base64}"
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_base64}
+                })
+                groq_messages.append({"role": "user", "content": user_content})
+            else:
+                groq_messages.append({"role": "user", "content": user_text})
         else:
-            groq_messages = build_groq_messages(history, user_text)
+            groq_messages = build_groq_messages(history, user_text, image_base64)
             groq_messages = fit_to_context(groq_messages, MAX_CONTEXT_TOKENS)
 
         log(f"Final groq_messages count: {len(groq_messages)}")
-        for i, m in enumerate(groq_messages[:3]):
-            log(f"  [{i}] role={m['role']}, content={m.get('content', '')[:60]}...")
-        if len(groq_messages) > 3:
-            log(f"  ... and {len(groq_messages) - 3} more messages")
 
-        ai_text = call_groq(groq_messages)
+        ai_text = call_groq(groq_messages, has_image=bool(image_base64))
 
     except Exception as e:
         log(f"ERROR during chat processing: {e}")
@@ -620,8 +806,9 @@ def api_chat() -> Any:
     if not ai_text:
         ai_text = random.choice(["ну и что", "хз что сказать", "ага"])
 
-    messages = split_response(ai_text)
-    log(f"Split into {len(messages)} messages: {messages}")
+    clean_text, image_url = parse_image_tag(ai_text)
+    messages = split_response(clean_text)
+    log(f"Split into {len(messages)} messages, image_url={image_url}")
 
     try:
         save_message(conn, user_id, "user", user_text)
@@ -633,7 +820,11 @@ def api_chat() -> Any:
     finally:
         conn.close()
 
-    return jsonify({"messages": messages})
+    response_data: Dict[str, Any] = {"messages": messages}
+    if image_url:
+        response_data["image_url"] = image_url
+
+    return jsonify(response_data)
 
 
 init_database()

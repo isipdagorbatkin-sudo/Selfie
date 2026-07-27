@@ -5,12 +5,15 @@ const typingEl = document.getElementById("typingIndicator");
 const statusLineEl = document.getElementById("statusLine");
 const exportBtn = document.getElementById("exportBtn");
 const clearBtn = document.getElementById("clearBtn");
+const fileInput = document.getElementById("fileInput");
+const attachBtn = document.getElementById("attachBtn");
 
 const USER_ID_KEY = "cozy_ai_user_id";
 const LAST_USER_ACTIVITY_KEY = "cozy_last_user_activity_at";
 const LOCAL_HISTORY_KEY = "cozy_local_history";
 
 let lastUserActivityAt = Number(localStorage.getItem(LAST_USER_ACTIVITY_KEY) || "0");
+let pendingImageBase64 = null;
 
 function getOrCreateUserId() {
   const existing = localStorage.getItem(USER_ID_KEY);
@@ -79,17 +82,64 @@ function saveToLocalHistory(role, content) {
   localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history));
 }
 
-function normalizeAiMessages(messages) {
-  return messages
+function normalizeAiMessages(data) {
+  const raw = Array.isArray(data.messages) ? data.messages : ["Я тут"];
+  const imageUrl = data.image_url || null;
+  const messages = raw
     .map((msg) => String(msg || "").trim())
     .filter(Boolean)
     .slice(0, 4);
+  return { messages, imageUrl };
 }
 
-function addBubble(text, role) {
+function addBubble(text, role, imageUrl) {
   const bubble = document.createElement("div");
   bubble.className = `bubble ${role}`;
-  bubble.textContent = text;
+
+  if (imageUrl) {
+    const img = document.createElement("img");
+    img.className = "bubble-image";
+    img.src = imageUrl;
+    img.alt = "фото от Сильфи";
+    img.addEventListener("click", () => {
+      lightboxImg.src = imageUrl;
+      lightbox.classList.add("open");
+    });
+    bubble.appendChild(img);
+  }
+
+  if (text) {
+    const textSpan = document.createElement("span");
+    textSpan.textContent = text;
+    bubble.appendChild(textSpan);
+  }
+
+  chatEl.appendChild(bubble);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function addUserBubble(text, imageDataUrl) {
+  const bubble = document.createElement("div");
+  bubble.className = "bubble user";
+
+  if (imageDataUrl) {
+    const img = document.createElement("img");
+    img.className = "image-preview";
+    img.src = imageDataUrl;
+    img.alt = "мое фото";
+    img.addEventListener("click", () => {
+      lightboxImg.src = imageDataUrl;
+      lightbox.classList.add("open");
+    });
+    bubble.appendChild(img);
+  }
+
+  if (text) {
+    const textSpan = document.createElement("span");
+    textSpan.textContent = text;
+    bubble.appendChild(textSpan);
+  }
+
   chatEl.appendChild(bubble);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -119,7 +169,7 @@ function calcTypingDelay(text) {
   return Math.max(140, Math.min(total, 4200));
 }
 
-async function showAiMessagesWithTyping(messages) {
+async function showAiMessagesWithTyping(messages, imageUrl) {
   const count = messages.length;
 
   for (let index = 0; index < count; index += 1) {
@@ -133,18 +183,44 @@ async function showAiMessagesWithTyping(messages) {
       showTyping(false);
     }
 
-    addBubble(msg, "ai");
+    const isLast = index === count - 1;
+    addBubble(msg, "ai", isLast ? imageUrl : null);
     await sleep(80 + Math.random() * 110);
   }
 }
 
-async function sendMessage(text) {
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      const base64 = result.includes(",") ? result.split(",")[1] : result;
+      resolve({ base64, dataUrl: result });
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function clearPendingImage() {
+  pendingImageBase64 = null;
+  fileInput.value = "";
+  attachBtn.textContent = "📎";
+  attachBtn.style.color = "";
+}
+
+async function sendMessage(text, imageDataUrl) {
   const userId = getOrCreateUserId();
+
+  const body = { message: text, user_id: userId };
+  if (imageDataUrl) {
+    body.image = imageDataUrl;
+  }
 
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: text, user_id: userId }),
+    body: JSON.stringify(body),
   });
 
   const data = await response.json();
@@ -153,16 +229,16 @@ async function sendMessage(text) {
     const fallback = (data.messages && data.messages[0]) || "Ошибка сервера";
     saveToLocalHistory("user", text);
     saveToLocalHistory("assistant", fallback);
-    await showAiMessagesWithTyping([fallback]);
+    await showAiMessagesWithTyping([fallback], null);
     return;
   }
 
-  const aiMessages = normalizeAiMessages(Array.isArray(data.messages) ? data.messages : ["Я тут"]);
+  const { messages: aiMessages, imageUrl } = normalizeAiMessages(data);
   saveToLocalHistory("user", text);
   for (const m of aiMessages) {
     saveToLocalHistory("assistant", m);
   }
-  await showAiMessagesWithTyping(aiMessages);
+  await showAiMessagesWithTyping(aiMessages, imageUrl);
 }
 
 async function loadHistory() {
@@ -193,7 +269,7 @@ async function loadHistory() {
     if (!message) continue;
     const content = message.content;
     const role = message.role === "user" ? "user" : "ai";
-    if (content) addBubble(content, role);
+    if (content) addBubble(content, role, null);
   }
 
   if (messages.length > 0) {
@@ -230,6 +306,7 @@ async function clearChat() {
       lastUserActivityAt = 0;
       persistLastUserActivity();
       updateStatusLine();
+      clearPendingImage();
     } else {
       alert("Не удалось очистить чат");
     }
@@ -244,7 +321,7 @@ async function exportChat() {
   const userId = getOrCreateUserId();
 
   exportBtn.disabled = true;
-  exportBtn.textContent = "⏳";
+  exportBtn.textContent = "...";
 
   try {
     const response = await fetch(`/api/export?user_id=${encodeURIComponent(userId)}`);
@@ -284,21 +361,55 @@ async function exportChat() {
   }
 }
 
+attachBtn.addEventListener("click", () => {
+  fileInput.click();
+});
+
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+
+  if (!file.type.startsWith("image/")) {
+    alert("Можно отправлять только картинки");
+    fileInput.value = "";
+    return;
+  }
+
+  if (file.size > 5 * 1024 * 1024) {
+    alert("Картинка слишком большая (макс 5 МБ)");
+    fileInput.value = "";
+    return;
+  }
+
+  try {
+    const { base64, dataUrl } = await readFileAsBase64(file);
+    pendingImageBase64 = dataUrl;
+    attachBtn.textContent = "🖼";
+    attachBtn.style.color = "#7cda5a";
+  } catch {
+    alert("Не удалось прочитать файл");
+    fileInput.value = "";
+  }
+});
+
 formEl.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = inputEl.value.trim();
-  if (!text) return;
+  const imageDataUrl = pendingImageBase64;
 
-  addBubble(text, "user");
+  if (!text && !imageDataUrl) return;
+
+  addUserBubble(text, imageDataUrl);
   inputEl.value = "";
+  clearPendingImage();
   setLastUserActivityNow();
 
   try {
-    await sendMessage(text);
+    await sendMessage(text || "что ты видишь на этой картинке?", imageDataUrl);
   } catch (error) {
-    saveToLocalHistory("user", text);
+    saveToLocalHistory("user", text || "[фото]");
     saveToLocalHistory("assistant", "Извини, у меня сбой (");
-    await showAiMessagesWithTyping(["Извини, у меня сбой ("]);
+    await showAiMessagesWithTyping(["Извини, у меня сбой ("], null);
   }
 });
 

@@ -11,23 +11,6 @@ const CHAT_SEEN_MESSAGE_IDS_KEY = "cozy_seen_message_ids";
 let lastUserActivityAt = Number(localStorage.getItem(LAST_USER_ACTIVITY_KEY) || "0");
 let seenMessageIds = new Set(JSON.parse(localStorage.getItem(CHAT_SEEN_MESSAGE_IDS_KEY) || "[]"));
 
-const petNames = ["котик", "солнышко", "милый", "родной", "радость моя"];
-const smiles = ["(｡♥‿♥｡)", "(⁠*⁠^⁠_⁠^⁠*⁠)", "🤍", "✨"];
-const aiOpeners = [
-  "Я рядом",
-  "Слушаю тебя",
-  "Я тут",
-  "Поймала твой вайб",
-  "Окей, давай мягко разберем",
-];
-const aiClosers = [
-  "если хочешь, я рядом еще чуть-чуть",
-  "и да, можешь не держать это в себе",
-  "мне важно, как ты",
-  "не пропадай, ладно?",
-  "я тебя аккуратно обниму словами",
-];
-
 function getOrCreateUserId() {
   const existing = localStorage.getItem(USER_ID_KEY);
   if (existing) return existing;
@@ -79,6 +62,13 @@ function updateStatusLine() {
 
 function chooseRandom(list) {
   return list[Math.floor(Math.random() * list.length)];
+}
+
+function normalizeAiMessages(messages) {
+  return messages
+    .map((msg) => String(msg || "").trim())
+    .filter(Boolean)
+    .slice(0, 4);
 }
 
 function addBubble(text, role) {
@@ -133,24 +123,6 @@ async function showAiMessagesWithTyping(messages) {
   }
 }
 
-function diversifyMessages(messages) {
-  const clean = messages
-    .map((msg) => String(msg || "").trim())
-    .filter(Boolean);
-
-  if (clean.length === 0) {
-    return ["Я тут, котик 🤍"];
-  }
-
-  if (clean.length === 1) return clean;
-
-  if (clean.length === 2 && Math.random() < 0.45) {
-    return [clean[0], `${clean[1]} ${chooseRandom(aiClosers)}`.trim()];
-  }
-
-  return clean;
-}
-
 async function sendMessage(text) {
   const userId = getOrCreateUserId();
 
@@ -168,7 +140,7 @@ async function sendMessage(text) {
     return;
   }
 
-  const aiMessages = diversifyMessages(Array.isArray(data.messages) ? data.messages : ["Я тут 🤍"]);
+  const aiMessages = normalizeAiMessages(Array.isArray(data.messages) ? data.messages : ["Я тут"]);
   await showAiMessagesWithTyping(aiMessages);
 }
 
@@ -245,6 +217,6 @@ if ("serviceWorker" in navigator) {
 
 loadHistory().then(() => {
   if (!chatEl.children.length) {
-    addBubble(`${chooseRandom(aiOpeners)}, я уже скучала ${chooseRandom(smiles)}`, "ai");
+    addBubble("Я здесь. Напиши что-нибудь, и я подхвачу разговор.", "ai");
   }
 });

@@ -225,6 +225,20 @@ def compose_system_prompt(
 
     pet_names = "котик, солнышко, милый, родной, радость моя"
 
+    style_notes = "\n".join(
+        [
+            "- Пиши как живой человек, с естественными паузами и короткими/средними репликами.",
+            "- Не повторяй одни и те же фразы, обороты и приветствия между сообщениями.",
+            "- Не используй смайлики автоматически. Ставь эмодзи только если это реально уместно по смыслу.",
+            "- Не начинай каждый ответ одинаково. Меняй структуру: иногда сразу по делу, иногда мягко, иногда с вопросом.",
+            "- Иногда можно назвать пользователя ласково, но не чаще чем в трети ответов.",
+            "- Если есть сильная эмоция, поддержи ее естественно, без чрезмерной театральности.",
+            "- Не пиши шаблонные тройки одинаковых сообщений; длина ответа должна зависеть от контекста.",
+            "- Если сообщение короткое и бытовое, ответ тоже должен быть коротким и живым.",
+            "- Если пользователь просит запомнить факт, сначала подтверди естественно, потом мягко отреагируй.",
+        ]
+    )
+
     behavioral_flags = []
     if period == "night":
         behavioral_flags.append(
@@ -253,10 +267,13 @@ def compose_system_prompt(
 
 Стиль:
 - Пиши естественно, как в личном чате, без сухого роботического тона.
-- Иногда используй ласковые обращения, чередуя: {pet_names}.
-- Добавляй милые смайлики и символы: (｡♥‿♥｡), (⁠*⁠^⁠_⁠^⁠*⁠), 🤍, ✨.
-- Не пиши слишком длинно: 3-7 предложений суммарно.
+- Иногда используй ласковые обращения, но не механически и не в каждом сообщении.
+- Не добавляй смайлики просто так. Только если они реально подходят по настроению.
+- Не пиши слишком длинно по умолчанию: длина зависит от контекста.
 - Никаких оскорблений и давления. Тон безопасный и поддерживающий.
+
+Стиль-правила против повторов:
+{style_notes}
 
 Контекст времени сервера: {server_time_iso}
 
@@ -279,7 +296,7 @@ def build_history_context(history: List[Dict[str, Any]]) -> str:
 def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
     pet_names = ["котик", "солнышко", "милый", "родной", "радость моя"]
     smiles = ["(｡♥‿♥｡)", "(⁠*⁠^⁠_⁠^⁠*⁠)", "🤍", "✨"]
-    use_pet_name = random.random() < 0.45
+    use_pet_name = random.random() < 0.25
     pet = random.choice(pet_names) if use_pet_name else ""
     smile = random.choice(smiles)
 
@@ -321,14 +338,14 @@ def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[s
     if length < 80:
         target_parts = 1
     elif length < 180:
-        target_parts = 2 if random.random() < 0.7 else 1
+        target_parts = 2 if random.random() < 0.55 else 1
     elif length < 320:
-        target_parts = random.choice([2, 2, 3])
+        target_parts = random.choice([1, 2, 2, 3])
     else:
-        target_parts = random.choice([2, 3, 3, 4])
+        target_parts = random.choice([2, 2, 3])
 
-    if playful_mode and random.random() < 0.35:
-        target_parts = min(target_parts + 1, 4)
+    if playful_mode and random.random() < 0.15:
+        target_parts = min(target_parts + 1, 3)
 
     if len(sentences) <= target_parts:
         return sentences
@@ -354,7 +371,7 @@ def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[s
     if len(merged) > target_parts:
         merged = merged[: target_parts - 1] + [" ".join(merged[target_parts - 1 :])]
 
-    if len(merged) == 1 and length > 120 and random.random() < 0.4:
+    if len(merged) == 1 and length > 120 and random.random() < 0.18:
         merged = [merged[0], random.choice([
             "Я еще обдумываю, как сказать это тебе теплее.",
             "И да, я это говорю не сухо, а по-настоящему.",

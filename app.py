@@ -5,35 +5,20 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template, request
-from google import genai
+from gigachat import GigaChat
 from psycopg import connect
 from psycopg.rows import dict_row
 
 
 app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_MODEL_CANDIDATES = [
-    model.strip()
-    for model in os.environ.get(
-        "GEMINI_MODEL_CANDIDATES",
-        f"{GEMINI_MODEL},gemini-2.0-flash-lite,gemini-1.5-flash",
-    ).split(",")
-    if model.strip()
-]
+GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS", "")
+GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_MODEL = os.environ.get("GIGACHAT_MODEL", "GigaChat")
+GIGACHAT_VERIFY_SSL_CERTS = os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "1") == "1"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 APP_TIMEZONE_OFFSET = int(os.environ.get("APP_TIMEZONE_OFFSET", "3"))
 ENABLE_LOCAL_FALLBACK = os.environ.get("ENABLE_LOCAL_FALLBACK", "1") == "1"
-
-
-def build_gemini_client() -> Optional[genai.Client]:
-    if not GEMINI_API_KEY:
-        return None
-    return genai.Client(api_key=GEMINI_API_KEY)
-
-
-gemini_client = build_gemini_client()
 
 
 def get_db_connection():
@@ -456,32 +441,38 @@ def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
     return result
 
 
-def generate_with_gemini(system_prompt: str, user_prompt: str) -> str:
-    if gemini_client is None:
-        raise RuntimeError("Gemini client is not configured")
+def generate_with_gigachat(system_prompt: str, user_prompt: str) -> str:
+    if not GIGACHAT_CREDENTIALS:
+        raise RuntimeError("GigaChat client is not configured")
 
-    last_error: Optional[Exception] = None
-    for model_name in GEMINI_MODEL_CANDIDATES:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    with GigaChat(
+        credentials=GIGACHAT_CREDENTIALS,
+        scope=GIGACHAT_SCOPE,
+        verify_ssl_certs=GIGACHAT_VERIFY_SSL_CERTS,
+    ) as client:
         try:
-            model_response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=[
-                    {"role": "user", "parts": [{"text": system_prompt}]},
-                    {"role": "user", "parts": [{"text": user_prompt}]},
-                ],
+            response = client.chat(
+                messages,
+                model=GIGACHAT_MODEL,
             )
-            ai_text = (model_response.text or "").strip()
-            if ai_text:
-                return ai_text
-        except Exception as ex:
-            last_error = ex
-            if "429" in str(ex) or "RESOURCE_EXHAUSTED" in str(ex):
-                continue
-            raise
+        except TypeError:
+            response = client.chat(
+                messages=messages,
+                model=GIGACHAT_MODEL,
+            )
 
-    if last_error:
-        raise last_error
-    return ""
+    try:
+        message = response.choices[0].message
+        if isinstance(message, dict):
+            return str(message.get("content", "")).strip()
+        return str(getattr(message, "content", "")).strip()
+    except Exception:
+        return str(response).strip()
 
 
 def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[str]:
@@ -597,8 +588,8 @@ def api_chat() -> Any:
     if not user_text:
         return jsonify({"messages": ["Напиши мне что-нибудь, я рядом 🤍"]}), 400
 
-    if gemini_client is None:
-        return jsonify({"messages": ["Не настроен GEMINI_API_KEY в переменных окружения."]}), 500
+    if gigachat_client is None:
+        return jsonify({"messages": ["Не настроен GIGACHAT_CREDENTIALS в переменных окружения."]}), 500
 
     db_conn = get_db_connection()
     server_now = datetime.now(timezone.utc)
@@ -658,10 +649,10 @@ def api_chat() -> Any:
 """.strip()
 
     try:
-        ai_text = generate_with_gemini(system_prompt, user_prompt)
+        ai_text = generate_with_gigachat(system_prompt, user_prompt)
     except Exception as ex:
         err_text = str(ex)
-        is_quota = "429" in err_text or "RESOURCE_EXHAUSTED" in err_text or "quota" in err_text.lower()
+        is_quota = "quota" in err_text.lower() or "limit" in err_text.lower() or "429" in err_text
 
         if ENABLE_LOCAL_FALLBACK and is_quota:
             fallback_messages = build_local_fallback_messages(user_text, period)

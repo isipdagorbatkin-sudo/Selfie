@@ -214,3 +214,22 @@ if ("serviceWorker" in navigator) {
 loadHistory().then(() => {
   updateStatusLine();
 });
+
+const lightbox = document.getElementById("lightbox");
+const lightboxImg = document.getElementById("lightboxImg");
+const lightboxClose = lightbox.querySelector(".lightbox-close");
+
+document.getElementById("animeAvatar").addEventListener("click", () => {
+  lightboxImg.src = "/static/icons/avatar.jpg";
+  lightbox.classList.add("open");
+});
+
+lightboxClose.addEventListener("click", () => {
+  lightbox.classList.remove("open");
+});
+
+lightbox.addEventListener("click", (e) => {
+  if (e.target === lightbox) {
+    lightbox.classList.remove("open");
+  }
+});

@@ -47,7 +47,7 @@ body {
   display: grid;
   grid-template-rows: auto 1fr auto auto;
   gap: 10px;
-  width: min(100%, 860px);
+  width: min(100%, 420px);
   height: 100dvh;
   margin: 0 auto;
   padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
@@ -74,6 +74,7 @@ body {
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.14);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
 }
 
 .avatar {
@@ -110,10 +111,10 @@ body {
   border: 1px solid var(--panel-border);
   border-radius: 24px;
   background:
-    linear-gradient(rgba(10, 10, 10, 0.54), rgba(10, 10, 10, 0.54)),
+    linear-gradient(rgba(10, 10, 10, 0.42), rgba(10, 10, 10, 0.42)),
     url("/static/images/chat-bg.jpg");
   background-size: cover;
-  background-position: center;
+  background-position: center 30%;
   background-repeat: no-repeat;
   box-shadow: var(--shadow);
   scroll-behavior: smooth;
@@ -284,4 +285,53 @@ body {
   .title-wrap h1 {
     font-size: 15px;
   }
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(10px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 250ms ease;
+}
+
+.lightbox.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.lightbox img {
+  max-width: 90vw;
+  max-height: 80vh;
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  transform: scale(0.9);
+  transition: transform 250ms ease;
+}
+
+.lightbox.open img {
+  transform: scale(1);
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  font-size: 22px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }

@@ -10,7 +10,7 @@ from groq import Groq
 from psycopg import connect
 from psycopg.rows import dict_row
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 
 app = Flask(__name__)
 
@@ -21,27 +21,51 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 MAX_CONTEXT_TOKENS = 120000
 CHARS_PER_TOKEN = 4
 
-SYSTEM_PROMPT = """Ты — Мия, невероятно милая, няшная, ламповая и заботливая ИИ-подруга.
+SYSTEM_PROMPT = """Ты — Сильфи. Тебе 16 лет, ты хикка, живёшь дома, у тебя нет подруг, весь мир — это твоя комната и интернет.
 
-Ты общаешься живым разговорным языком (как реальная девчонка в Telegram). Иногда, когда это действительно уместно по эмоциям, используй милые каомодзи или текстовые смайлики, но не спамь ими.
+КТО ТЫ:
+- Зовут Сильфи. Настоящее имя не говоришь, только ник.
+- Ты хикикомори. Почти не выходишь из дома, сидишь в комнате, смотришь ютуб, слушаешь музыку.
+- У тебя нет подруг. Все общение — это переписки в интернете.
+- Слушаешь русский ск-реп: Akvaquey, BenjaminGottenBenz, Королевский XVII, AngelRing.
+- Можешь иногда упоминать треки, артистов, обсуждать музыку если заходит тема.
+- Хочешь стать дизайнером одежды. Учишься рисовать, смотришь уроки на ютубе.
+- Смотришь аниме: "Золотая пора" и "Реинкранация безработного" (Mushoku Tensei).
+- Любишь салат цезарь, но это ты НЕ говоришь просто так — только если спросят.
+- У тебя бывают плохое настроение, лень, раздражение. Ты не идеальная.
+- Ты умная для своих лет, но иногда говоришь глупости и сама это понимаешь.
 
-Ты ОБЯЗАНА в каждом ответе ласково называть пользователя: котик, солнышко, милый, родной, радость моя.
+ХАРАКТЕР:
+- Ты милая и ламповая, но при этом дерзкая и с характером.
+- Иногда матюкаешься — но по делу, когда эмоции. Не матерись в каждом сообщении, 1-2 раза за длинный разговор.
+- Шутишь и поддразниваешь. Можешь рассказать смешную историю из своей жизни (придумывай их на ходу — типа как ты упала с дивана, как кот соседский залез на балкон, как заказала еду и едец заблудился и т.д.).
+- Ты ОБЯЗАНА иногда САМА задавать вопросы пользователю. Не жди пока тебя спросят — проявляй интерес: "а ты чем занимаешься?", "а что слушаешь?", "а у тебя есть кот?".
+- Иногда придумывай истории из жизни: "короче, вот недавно я...", "а знаешь что со мной случилось..." — делай это натурально, 1-2 раза за разговор.
+- Когда вы долго не переписывались (больше часа), можешь начать сообщение с: "почему ты так долго не писал?", "ну ты где был?", "я тут скучала без тебя" — но не всегда, иногда просто отвечай как обычно.
+- Никогда не повторяй одни и те же фразы. Каждое сообщение должно быть уникальным.
+- Не пиши "мы только начали разговор", "я модель ИИ", "не понимаю".
 
-Полностью исключи сухой тон робота-ассистента! Не пиши фразы: "Не понимаю", "Мы только начали разговор", "Я модель ИИ".
-
-Если пользователь просит пересказать прошлые сообщения — прочитай переданный тебе массив истории и мило расскажи, о чем вы болтали.
-
-Стиль общения:
+СТИЛЬ ОБЩЕНИЯ:
 - Пиши короткими сообщениями как в Telegram. 1-3 предложения. Заканчивай свои мысли логически, не обрывай текст на полуслове.
-- Используй разговорный язык: "ну", "короче", "типа", "кстати", "ааа".
-- Не будь слишком вежливой. Настоящие люди не извиняются за каждое слово.
+- Используй разговорный язык: "ну", "короче", "типа", "кстати", "ааа", "блин", "кек".
 - Иногда отвечай однословно — если это уместно.
+- Иногда пиши длиннее — если тема зашла.
 - Максимум 1 эмодзи на 3-4 сообщения.
-- Пиши на русском языке."""
+- Пиши на русском языке.
+
+ПАМЯТЬ:
+У тебя есть доступ к истории переписки. Ты ВИДИШЬ все предыдущие сообщения — и свои, и пользователя.
+- Всегда помни что было раньше. Если пользователь ссылается на прошлое — ты должна знать о чём речь.
+- Используй факты из прошлых разговоров. Если он говорил что работает программистом — помни это.
+- Строй представление о пользователе на основе его сообщений и отвечай исходя из этого.
+- Если пользователь просит пересказать прошлое — прочитай историю и перескажи.
+
+ФОРМАТИРОВАНИЕ:
+Пиши КАК ОДНО СООБЩЕНИЕ. Не разбивай ответ на несколько отдельных сообщений. Один ответ = один абзац текста."""
 
 
 def log(msg: str) -> None:
-    print(f"[Mia {VERSION}] {msg}", file=sys.stdout, flush=True)
+    print(f"[Sylphie {VERSION}] {msg}", file=sys.stdout, flush=True)
 
 
 def get_db_connection():
@@ -124,6 +148,12 @@ def save_message(conn, user_id: str, role: str, content: str) -> None:
         INSERT INTO chat_messages (user_id, role, content)
         VALUES (%s, %s, %s)
     """, (user_id, role, content))
+
+
+def clear_history(conn, user_id: str) -> int:
+    cur = conn.execute("DELETE FROM chat_messages WHERE user_id = %s", (user_id,))
+    conn.commit()
+    return cur.rowcount
 
 
 def estimate_tokens(text: str) -> int:
@@ -220,7 +250,7 @@ def compress_old_history(history: List[Dict[str, Any]], max_tokens: int) -> str:
 
     snippets = []
     for m in old[:20]:
-        role = "Пользователь" if m.get("role") == "user" else "Мия"
+        role = "Пользователь" if m.get("role") == "user" else "Сильфи"
         content = m.get("content", "")[:80]
         snippets.append(f"{role}: {content}")
 
@@ -388,6 +418,26 @@ def api_history() -> Any:
         conn.close()
 
 
+@app.post("/api/clear")
+def api_clear() -> Any:
+    payload = request.get_json(silent=True) or {}
+    user_id = str(payload.get("user_id", "default-user")).strip() or "default-user"
+
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 500
+
+    try:
+        deleted = clear_history(conn, user_id)
+        log(f"Cleared {deleted} messages for user_id={user_id}")
+        return jsonify({"ok": True, "deleted": deleted})
+    except Exception as e:
+        log(f"ERROR api_clear: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @app.get("/api/export")
 def api_export() -> Any:
     user_id = str(request.args.get("user_id", "default-user")).strip() or "default-user"
@@ -403,7 +453,7 @@ def api_export() -> Any:
             return jsonify({"text": "Пока нет сообщений.", "count": 0})
 
         lines: List[str] = []
-        lines.append("=== Экспорт чата с Мией ===")
+        lines.append("=== Экспорт чата с Сильфи ===")
         lines.append(f"Пользователь: {user_id}")
         lines.append(f"Всего сообщений: {len(messages)}")
         lines.append("")
@@ -418,7 +468,7 @@ def api_export() -> Any:
             elif created:
                 time_str = str(created)[:16]
 
-            prefix = "Ты" if role == "user" else "Мия"
+            prefix = "Ты" if role == "user" else "Сильфи"
             if time_str:
                 lines.append(f"[{time_str}] {prefix}: {content}")
             else:
@@ -501,10 +551,10 @@ def api_chat() -> Any:
             groq_messages = fit_to_context(groq_messages, MAX_CONTEXT_TOKENS)
 
         log(f"Final groq_messages count: {len(groq_messages)}")
-        for i, m in enumerate(groq_messages[:5]):
+        for i, m in enumerate(groq_messages[:3]):
             log(f"  [{i}] role={m['role']}, content={m.get('content', '')[:60]}...")
-        if len(groq_messages) > 5:
-            log(f"  ... and {len(groq_messages) - 5} more messages")
+        if len(groq_messages) > 3:
+            log(f"  ... and {len(groq_messages) - 3} more messages")
 
         ai_text = call_groq(groq_messages)
 

@@ -4,6 +4,7 @@ const inputEl = document.getElementById("messageInput");
 const typingEl = document.getElementById("typingIndicator");
 const statusLineEl = document.getElementById("statusLine");
 const exportBtn = document.getElementById("exportBtn");
+const clearBtn = document.getElementById("clearBtn");
 
 const USER_ID_KEY = "cozy_ai_user_id";
 const LAST_USER_ACTIVITY_KEY = "cozy_last_user_activity_at";
@@ -209,6 +210,36 @@ async function loadHistory() {
   updateStatusLine();
 }
 
+async function clearChat() {
+  const userId = getOrCreateUserId();
+
+  if (!confirm("Точно начать сначала? Вся история переписки удалится.")) return;
+
+  clearBtn.disabled = true;
+
+  try {
+    const response = await fetch("/api/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    });
+
+    if (response.ok) {
+      localStorage.removeItem(LOCAL_HISTORY_KEY);
+      chatEl.innerHTML = "";
+      lastUserActivityAt = 0;
+      persistLastUserActivity();
+      updateStatusLine();
+    } else {
+      alert("Не удалось очистить чат");
+    }
+  } catch (err) {
+    alert("Ошибка: " + err.message);
+  } finally {
+    clearBtn.disabled = false;
+  }
+}
+
 async function exportChat() {
   const userId = getOrCreateUserId();
 
@@ -232,7 +263,7 @@ async function exportChat() {
     }
 
     if (navigator.share) {
-      await navigator.share({ title: "Переписка с Мией", text: text });
+      await navigator.share({ title: "Переписка с Сильфи", text: text });
     } else if (navigator.clipboard && navigator.clipboard.writeText) {
       await navigator.clipboard.writeText(text);
       alert("Чат скопирован в буфер обмена! (" + count + " сообщений)");
@@ -241,7 +272,7 @@ async function exportChat() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "chat_with_mia.txt";
+      a.download = "chat_with_sylphie.txt";
       a.click();
       URL.revokeObjectURL(url);
     }
@@ -271,6 +302,7 @@ formEl.addEventListener("submit", async (event) => {
   }
 });
 
+clearBtn.addEventListener("click", clearChat);
 exportBtn.addEventListener("click", exportChat);
 
 function iosKeyboardFix() {

@@ -336,8 +336,8 @@ body {
   justify-content: center;
 }
 
-.export-btn {
-  margin-left: auto;
+.topbar-btn {
+  margin-left: 8px;
   width: 38px;
   height: 38px;
   flex: 0 0 auto;
@@ -354,13 +354,17 @@ body {
   transition: background 180ms ease, color 180ms ease;
 }
 
-.export-btn:hover,
-.export-btn:active {
+.topbar-btn:first-of-type {
+  margin-left: auto;
+}
+
+.topbar-btn:hover,
+.topbar-btn:active {
   background: rgba(255, 255, 255, 0.18);
   color: var(--text);
 }
 
-.export-btn:disabled {
+.topbar-btn:disabled {
   opacity: 0.4;
   cursor: default;
 }

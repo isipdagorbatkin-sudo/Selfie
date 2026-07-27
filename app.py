@@ -279,11 +279,12 @@ def build_history_context(history: List[Dict[str, Any]]) -> str:
 def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
     pet_names = ["котик", "солнышко", "милый", "родной", "радость моя"]
     smiles = ["(｡♥‿♥｡)", "(⁠*⁠^⁠_⁠^⁠*⁠)", "🤍", "✨"]
-    pet = random.choice(pet_names)
+    use_pet_name = random.random() < 0.45
+    pet = random.choice(pet_names) if use_pet_name else ""
     smile = random.choice(smiles)
 
     lower = user_text.lower()
-    intro = f"Я тут, {pet} {smile}"
+    intro = f"Я тут{', ' + pet if pet else ''} {smile}".strip()
 
     if period == "night":
         care = "Уже поздно... почему не спишь? Давай чуть выдохнем и потом отдыхать, ладно?"
@@ -297,9 +298,70 @@ def build_local_fallback_messages(user_text: str, period: str) -> List[str]:
     if any(word in lower for word in ["плохо", "груст", "устал", "трев", "депр"]):
         support = "Обниму мысленно крепко. Давай по шагам: вода, пару глубоких вдохов и я слушаю тебя внимательно."
     else:
-        support = "Расскажи еще чуть-чуть, мне правда важно, что у тебя на душе."
+        support = random.choice(
+            [
+                "Расскажи еще чуть-чуть, мне правда важно, что у тебя на душе.",
+                "Если хочешь, я могу просто побыть рядом и ничего не торопить.",
+                "Мне нравится слушать тебя вот так, спокойно и по-настоящему.",
+            ]
+        )
 
     return [intro, care, support]
+
+
+def build_diverse_reply(ai_text: str, period: str, playful_mode: bool) -> List[str]:
+    cleaned = re.sub(r"\n{2,}", "\n", ai_text.strip())
+    sentences = [s.strip() for s in re.split(r"\n|(?<=[.!?])\s+", cleaned) if s.strip()]
+
+    if not sentences:
+        return ["Я рядом, солнышко 🤍"]
+
+    target_parts = 1
+    length = len(cleaned)
+    if length < 80:
+        target_parts = 1
+    elif length < 180:
+        target_parts = 2 if random.random() < 0.7 else 1
+    elif length < 320:
+        target_parts = random.choice([2, 2, 3])
+    else:
+        target_parts = random.choice([2, 3, 3, 4])
+
+    if playful_mode and random.random() < 0.35:
+        target_parts = min(target_parts + 1, 4)
+
+    if len(sentences) <= target_parts:
+        return sentences
+
+    merged: List[str] = []
+    bucket = ""
+    max_chars = max(90, len(cleaned) // target_parts + 24)
+
+    for sentence in sentences:
+        if not bucket:
+            bucket = sentence
+            continue
+
+        if len(bucket) + len(sentence) + 1 <= max_chars:
+            bucket = f"{bucket} {sentence}"
+        else:
+            merged.append(bucket)
+            bucket = sentence
+
+    if bucket:
+        merged.append(bucket)
+
+    if len(merged) > target_parts:
+        merged = merged[: target_parts - 1] + [" ".join(merged[target_parts - 1 :])]
+
+    if len(merged) == 1 and length > 120 and random.random() < 0.4:
+        merged = [merged[0], random.choice([
+            "Я еще обдумываю, как сказать это тебе теплее.",
+            "И да, я это говорю не сухо, а по-настоящему.",
+            "Если хочешь, я потом разверну мысль еще мягче.",
+        ])]
+
+    return [part.strip() for part in merged if part.strip()]
 
 
 @app.get("/")
@@ -310,6 +372,45 @@ def index():
 @app.get("/health")
 def health() -> Any:
     return jsonify({"ok": True})
+
+
+@app.get("/api/history")
+def api_history() -> Any:
+    user_id = str(request.args.get("user_id", "default-user")).strip() or "default-user"
+    db_conn = get_db_connection()
+
+    if db_conn is None:
+        return jsonify({"messages": []})
+
+    try:
+        with db_conn:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id::text, role, content, created_at
+                    FROM chat_messages
+                    WHERE user_id = %s
+                    ORDER BY created_at ASC
+                    LIMIT 200
+                    """,
+                    (user_id,),
+                )
+                rows = list(cur.fetchall() or [])
+
+                last_user_created_at = None
+                for row in reversed(rows):
+                    if row.get("role") == "user":
+                        last_user_created_at = row.get("created_at")
+                        break
+
+        return jsonify(
+            {
+                "messages": rows,
+                "last_user_created_at": last_user_created_at.isoformat() if isinstance(last_user_created_at, datetime) else None,
+            }
+        )
+    finally:
+        db_conn.close()
 
 
 @app.post("/api/chat")
@@ -422,7 +523,9 @@ def api_chat() -> Any:
     if not ai_text:
         ai_text = "Я рядом, котик 🤍 Расскажи, что у тебя на душе?"
 
-    messages = split_to_short_messages(ai_text, max_parts=3)
+    messages = build_diverse_reply(ai_text, period=period, playful_mode=playful_mode)
+    if not messages:
+        messages = split_to_short_messages(ai_text, max_parts=3)
 
     if db_conn is not None:
         try:
